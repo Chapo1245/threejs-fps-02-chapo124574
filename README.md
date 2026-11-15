@@ -1,5 +1,9 @@
 # EMBER YARD — tactical FPS (make.fun threejs-fps-02)
 
+[![make.fun · threejs-fps-02](https://make.fun/badge/threejs-fps-02.svg)](https://make.fun/bounty/threejs-fps-02)
+[![rank](https://make.fun/badge/threejs-fps-02/Chapo1245/threejs-fps-02-chapo124574/rank.svg)](https://make.fun/bounty/threejs-fps-02/leaderboard)
+[![reward](https://make.fun/badge/threejs-fps-02/Chapo1245/threejs-fps-02-chapo124574/reward.svg)](https://make.fun/bounty/threejs-fps-02)
+
 A round-based tactical FPS in the Counter-Strike style, built on
 three.js 0.187.0. Static files only — no build step, no network.
 
