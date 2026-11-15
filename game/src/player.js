@@ -1,132 +1,168 @@
-// player.js — the human player's controller: mouse look, WASD movement
-// with acceleration and friction, crouch, jump, and collision against the
-// map. The camera rides on the actor; the viewmodel bobs with movement.
-import { MOVE } from './config.js';
-import { clamp, lerp } from './util.js';
+// player.js — human input: keyboard + mouse on desktop, virtual joystick
+// + touch buttons on touch devices. Reads raw events, writes intents onto
+// the player actor (moveX/moveZ in world space, yaw/pitch, firing, sprint,
+// planting/defusing, reload/buy/grenade queues). The simulation reads the
+// intents; this module never moves the actor itself.
 
-export class PlayerController {
-  constructor(actor, world) {
-    this.a = actor;
-    this.world = world;
-    this.keys = new Set();
-    this.mouseDX = 0;
-    this.mouseDY = 0;
-    this.mouseDown = false;
-    this.adsHeld = false;
-    this.bobPhase = 0;
-    this.eyeY = MOVE.eyeStand;
-    this.fov = 75;
-    this.targetFov = 75;
-    // Reused scratch, never reallocated in the hot loop.
-    this.pos = { x: 0, z: 0 };
-  }
+import { S, player, buyItem } from './sim.js';
+import { WEAPONS, equipWeapon, refillWeapon, shoot, startReload, throwGrenade } from './combat.js';
+import { touch } from './touch.js';
+import { isBuyOpen } from './hud.js';
+import { MAP } from './mapdata.js';
 
-  get speed() {
-    return this.a.speed2d;
-  }
+const keys = {};
+let mouseDX = 0, mouseDY = 0;
+let firing = false, adsHeld = false;
+let prevFire = false;
+let ui = null;
 
-  look(dx, dy) {
-    this.a.yaw -= dx * 0.0022;
-    this.a.pitch = clamp(this.a.pitch - dy * 0.0022, -1.45, 1.45);
-  }
-
-  /** One fixed step of movement. `input` is the live key set. */
-  step(dt, input) {
-    const a = this.a;
-    if (!a.alive) return;
-    // Look first: mouse deltas accumulated since the last step.
-    if (this.mouseDX !== 0 || this.mouseDY !== 0) {
-      this.look(this.mouseDX, this.mouseDY);
-      this.mouseDX = 0;
-      this.mouseDY = 0;
+export function initPlayer(canvas, uiHooks) {
+  ui = uiHooks;
+  window.addEventListener('keydown', (e) => {
+    if (e.repeat) return;
+    keys[e.code] = true;
+    // With the buy menu open, number keys buy items (hud.js handles them).
+    if (isBuyOpen() && /^Digit[1-8]$/.test(e.code)) return;
+    if (e.code === 'KeyR') startReload(player());
+    if (e.code === 'KeyB') ui.toggleBuy();
+    if (e.code === 'KeyG') cycleGrenade();
+    if (e.code === 'Digit1') equipSlot(0);
+    if (e.code === 'Digit2') equipSlot(1);
+    if (e.code === 'Digit3') cycleGrenadeType();
+    if (e.code === 'Space') { player().jumpQueued = true; e.preventDefault(); }
+  });
+  window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+  canvas.addEventListener('click', () => {
+    if (!touch.active && S.phase !== 'menu' && document.pointerLockElement !== canvas) {
+      const p = canvas.requestPointerLock();
+      if (p && p.catch) p.catch(() => {});
     }
-    a.crouch = input.has('ControlLeft') || input.has('KeyC');
-    const sprint = (input.has('ShiftLeft') || input.has('ShiftRight')) && !a.crouch && !a.ads;
-    let top = a.crouch ? MOVE.crouchSpeed : sprint ? MOVE.sprintSpeed : MOVE.walkSpeed;
-    if (a.ads) top = MOVE.adsSpeed;
-    let fx = 0;
-    let fz = 0;
-    if (input.has('KeyW')) fz -= 1;
-    if (input.has('KeyS')) fz += 1;
-    if (input.has('KeyA')) fx -= 1;
-    if (input.has('KeyD')) fx += 1;
-    const len = Math.hypot(fx, fz);
-    if (len > 0) { fx /= len; fz /= len; }
-    const sin = Math.sin(a.yaw);
-    const cos = Math.cos(a.yaw);
-    // Forward is (-sin, -cos); right is (cos, -sin).
-    const wx = (-sin * fz + cos * fx) * top;
-    const wz = (-cos * fz - sin * fx) * top;
-    const accel = a.onGround ? MOVE.accel : MOVE.airAccel;
-    a.vx += (wx - a.vx) * Math.min(1, accel * dt / top * 4 + dt * 6);
-    a.vz += (wz - a.vz) * Math.min(1, accel * dt / top * 4 + dt * 6);
-    // Friction when no input: bleed speed instead of stopping dead.
-    if (len === 0 && a.onGround) {
-      const f = Math.max(0, 1 - MOVE.friction * dt);
-      a.vx *= f;
-      a.vz *= f;
-      if (Math.abs(a.vx) < 0.02) a.vx = 0;
-      if (Math.abs(a.vz) < 0.02) a.vz = 0;
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (document.pointerLockElement === canvas) {
+      mouseDX += e.movementX; mouseDY += e.movementY;
     }
-    // Integrate with collision, axis by axis so sliding along walls works.
-    this.pos.x = a.x + a.vx * dt;
-    this.pos.z = a.z;
-    if (!this.world.moveCircle(this.pos, MOVE.radius)) {
-      // No hit on X; try the combined move, then Z alone.
-      this.pos.x = a.x + a.vx * dt;
-      this.pos.z = a.z + a.vz * dt;
-      if (this.world.moveCircle(this.pos, MOVE.radius)) {
-        this.pos.x = a.x;
-        this.pos.z = a.z + a.vz * dt;
-        this.world.moveCircle(this.pos, MOVE.radius);
+  });
+  canvas.addEventListener('mousedown', (e) => {
+    if (document.pointerLockElement !== canvas) return;
+    if (e.button === 0) firing = true;
+    if (e.button === 2) adsHeld = true;
+  });
+  window.addEventListener('mouseup', (e) => {
+    if (e.button === 0) firing = false;
+    if (e.button === 2) adsHeld = false;
+  });
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  document.addEventListener('pointerlockchange', () => {
+    if (document.pointerLockElement !== canvas) { firing = false; adsHeld = false; }
+  });
+}
+
+// Owned weapon slots: 1 = sidearm, 2 = primary. Buying a primary replaces
+// the one in slot 2 (Counter-Strike style).
+function ownedSlots() {
+  const p = player();
+  const slots = ['p9'];
+  if (p.weapon !== 'p9') slots.push(p.weapon);
+  else if (p.ammoBag) {
+    for (const k of Object.keys(p.ammoBag)) if (k !== 'p9') slots.push(k);
+  }
+  return slots;
+}
+function equipSlot(i) {
+  const slots = ownedSlots();
+  if (slots[i]) equipWeapon(player(), slots[i]);
+}
+function cycleGrenade() {
+  const p = player();
+  const types = ['frag', 'smoke', 'flash'];
+  const cur = types.indexOf(p.grenadeSel);
+  for (let n = 1; n <= 3; n++) {
+    const t = types[(cur + n) % 3];
+    if ((p.grenades[t] || 0) > 0) { p.grenadeSel = t; return; }
+  }
+}
+function cycleGrenadeType() { cycleGrenade(); }
+
+// Called once per rendered frame, before the fixed-step simulation.
+export function readPlayerInput() {
+  const p = player();
+  if (!p.alive || S.phase === 'menu' || S.phase === 'matchend') {
+    p.moveX = 0; p.moveZ = 0;
+    return;
+  }
+  // --- look ---
+  const sens = 0.0023;
+  p.yaw -= mouseDX * sens;
+  p.pitch -= mouseDY * sens;
+  mouseDX = 0; mouseDY = 0;
+  if (touch.active) {
+    p.yaw -= touch.lookDX * 0.0042;
+    p.pitch -= touch.lookDY * 0.0042;
+    touch.lookDX = 0; touch.lookDY = 0;
+  }
+  p.pitch = Math.max(-1.45, Math.min(1.45, p.pitch));
+
+  // --- move: keyboard, or the touch joystick when it is held ---
+  let iy = 0, ix = 0;
+  if (keys.KeyW || keys.ArrowUp) iy += 1;
+  if (keys.KeyS || keys.ArrowDown) iy -= 1;
+  if (keys.KeyD || keys.ArrowRight) ix += 1;
+  if (keys.KeyA || keys.ArrowLeft) ix -= 1;
+  if (touch.active && Math.hypot(touch.moveX, touch.moveY) > 0.12) {
+    ix = touch.moveX;
+    iy = -touch.moveY; // joystick up = forward
+  }
+  const len = Math.hypot(ix, iy);
+  if (len > 1) { ix /= len; iy /= len; }
+  const fx = Math.cos(p.yaw), fz = Math.sin(p.yaw);
+  const rx = -Math.sin(p.yaw), rz = Math.cos(p.yaw);
+  p.moveX = fx * iy + rx * ix;
+  p.moveZ = fz * iy + rz * ix;
+
+  p.sprint = !!(keys.ShiftLeft || keys.ShiftRight) || touch.sprint;
+  p.crouch = !!(keys.KeyC || keys.ControlLeft);
+  p.ads = adsHeld && !touch.active;
+  if (touch.jumpQueued) { p.jumpQueued = true; touch.jumpQueued = false; }
+  if (touch.reloadQueued) { startReload(p); touch.reloadQueued = false; }
+  if (touch.buyQueued) { ui.toggleBuy(); touch.buyQueued = false; }
+  if (touch.grenadeQueued) { throwGrenade(p, p.grenadeSel); touch.grenadeQueued = false; }
+
+  // --- fire: mouse held, or the touch FIRE button held ---
+  const wantFire = firing || touch.firing;
+  const w = WEAPONS[p.weapon];
+  if (wantFire && S.phase === 'live') {
+    if (w.auto) shoot(p);
+    else if (!prevFire) shoot(p);
+  }
+  prevFire = wantFire;
+
+  // --- plant / defuse: hold E, or hold the touch INTERACT button ---
+  const interact = !!(keys.KeyE) || touch.interact;
+  p.planting = false; p.defusing = false;
+  if (interact && S.phase === 'live') {
+    if (p.hasBomb) {
+      const site = MAP.sites[S.targetSite];
+      if (p.x >= site.x0 && p.x <= site.x1 && p.z >= site.z0 && p.z <= site.z1) {
+        p.planting = true;
       }
-    } else {
-      this.pos.x = a.x;
-      this.pos.z = a.z + a.vz * dt;
-      this.world.moveCircle(this.pos, MOVE.radius);
-    }
-    // Stay inside the yard even if a wall gap is missed.
-    const b = this.world.map.bounds;
-    this.pos.x = clamp(this.pos.x, b.minX + 0.6, b.maxX - 0.6);
-    this.pos.z = clamp(this.pos.z, b.minZ + 0.6, b.maxZ - 0.6);
-    a.x = this.pos.x;
-    a.z = this.pos.z;
-    a.speed2d = Math.hypot(a.vx, a.vz);
-
-    // Jump + gravity.
-    if (input.has('Space') && a.onGround) {
-      a.vy = MOVE.jumpSpeed;
-      a.onGround = false;
-    }
-    a.vy -= MOVE.gravity * dt;
-    a.y += a.vy * dt;
-    if (a.y <= 0) {
-      a.y = 0;
-      a.vy = 0;
-      a.onGround = true;
-    }
-    // Recoil recovery and spread bloom decay.
-    a.recoilPitch = lerp(a.recoilPitch, 0, Math.min(1, dt * 7));
-    a.bloom = Math.max(0, a.bloom - dt * 2.4);
-    // Eye height eases between stand and crouch.
-    const targetEye = a.crouch ? MOVE.eyeCrouch : MOVE.eyeStand;
-    this.eyeY = lerp(this.eyeY, targetEye, Math.min(1, dt * 10));
-    this.bobPhase += a.speed2d * dt * 1.6;
-  }
-
-  /** Apply the actor to the camera each rendered frame. */
-  applyCamera(camera, dt, zoom) {
-    const a = this.a;
-    const bob = Math.sin(this.bobPhase * 2) * 0.018 * Math.min(1, a.speed2d / MOVE.walkSpeed);
-    camera.position.set(a.x, a.y + this.eyeY + bob, a.z);
-    camera.rotation.order = 'YXZ';
-    camera.rotation.y = a.yaw;
-    camera.rotation.x = a.pitch + a.recoilPitch;
-    camera.rotation.z = 0;
-    this.targetFov = zoom;
-    if (Math.abs(camera.fov - this.targetFov) > 0.05) {
-      camera.fov = lerp(camera.fov, this.targetFov, Math.min(1, dt * 12));
-      camera.updateProjectionMatrix();
+    } else if (S.bomb.state === 'planted') {
+      const d2 = (p.x - S.bomb.x) ** 2 + (p.z - S.bomb.z) ** 2;
+      if (d2 < 2.6) p.defusing = true;
     }
   }
+}
+
+// The buy menu calls this when the player clicks an item.
+export function buyKey(key) {
+  const p = player();
+  if (key === 'kevlar' || key === 'frag' || key === 'smoke' || key === 'flash') {
+    return buyItem(key);
+  }
+  const ok = buyItem(key);
+  if (ok) {
+    equipWeapon(p, key);
+    refillWeapon(p, key);
+  }
+  return ok;
 }

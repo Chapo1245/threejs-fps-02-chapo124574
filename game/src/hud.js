@@ -1,244 +1,239 @@
-// hud.js — the DOM layer: health/ammo/timer/score, the killfeed, the
-// crosshair, the buy menu, the round/match screens, and a 2D minimap.
-// It only reads state and writes DOM; it never touches the simulation.
-import { WEAPONS, GRENADES, PLANT_TIME, DEFUSE_TIME, BOMB_TIMER } from './config.js';
-import { buyOptions } from './weapons.js';
-import { PHASE } from './state.js';
+// hud.js — every DOM readout of the game: score bar, timer, health,
+// ammo, money, killfeed, crosshair, banners, buy menu, and the circular
+// minimap (streets + sites + live dots). Writes only change when values
+// change, so the HUD costs almost nothing per frame.
+
+import { S, player } from './sim.js';
+import { WEAPONS } from './combat.js';
+import { MAP } from './mapdata.js';
+import { segmentBlocked } from './util.js';
 
 const $ = (id) => document.getElementById(id);
-
-function fmtTime(s) {
-  const t = Math.max(0, Math.ceil(s));
-  return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
+const cache = {};
+function setText(id, v) {
+  if (cache[id] !== v) { cache[id] = v; $(id).textContent = v; }
+}
+function setHtml(id, v) {
+  if (cache[id] !== v) { cache[id] = v; $(id).innerHTML = v; }
 }
 
-export class Hud {
-  constructor(S, map) {
-    this.S = S;
-    this.map = map;
-    this.hitAt = 0;
-    this.bannerUntil = 0;
-    this.mm = $('minimap').getContext('2d');
-    this.mmW = 150;
-    this.mmH = 112;
-  }
+let buyOpen = false;
+let flashV = 0, dmgV = 0, hitT = 0, toastT = 0;
+let spotted = {}; // enemy id -> time until which it shows on the minimap
 
-  showHud(on) {
-    $('hud').classList.toggle('on', on);
-  }
+const BUY_ITEMS = [
+  { key: 'ar51', name: 'AR-51 Rifle', desc: 'Auto rifle. 34 dmg, 3x headshot. The all-rounder.', price: 2700 },
+  { key: 'hornet', name: 'Hornet-9 SMG', desc: 'Fast SMG. 25 dmg, close quarters shredder.', price: 1500 },
+  { key: 'longbow', name: 'Longbow DMR', desc: '88 dmg per shot. One tap at range, slow to cycle.', price: 4200 },
+  { key: 'breacher', name: 'Breacher Shotgun', desc: '8 pellets, 12 dmg each. Devastating up close.', price: 1800 },
+  { key: 'frag', name: 'Frag Grenade', desc: 'Bounces, then bursts: up to 130 damage in 7 m.', price: 300 },
+  { key: 'smoke', name: 'Smoke Grenade', desc: '15 s smoke wall. Blocks sight — bots included.', price: 300 },
+  { key: 'flash', name: 'Flash Grenade', desc: 'Blinds anyone looking at it. Bots freeze too.', price: 200 },
+  { key: 'kevlar', name: 'Kevlar Vest', desc: 'Takes 40% off every hit. Survive one more duel.', price: 650 },
+];
 
-  show(id, on) {
-    $(id).classList.toggle('on', on);
-  }
+export function isBuyOpen() { return buyOpen; }
 
-  /** One frame of HUD updates (cheap DOM writes, only when changed). */
-  update(now, spreadDeg) {
-    const S = this.S;
-    const p = S.player;
-    if (!p) return;
-    $('healthnum').textContent = String(Math.ceil(p.hp));
-    $('healthfill').style.width = `${Math.max(0, p.hp)}%`;
-    $('healthfill').style.background = p.hp > 50 ? '#58d68d' : p.hp > 25 ? '#ffb454' : '#ff5d5d';
-    $('armorfill').style.width = `${Math.max(0, p.armor)}%`;
-    $('money').innerHTML = `$${p.money} <small>· buy with B</small>`;
-    $('scoreV').textContent = String(S.score.V);
-    $('scoreJ').textContent = String(S.score.J);
-    const aliveV = S.actors.filter((a) => a.team === 'V' && a.alive).length;
-    const aliveJ = S.actors.filter((a) => a.team === 'J' && a.alive).length;
-    $('alive').textContent = `${aliveV}v${aliveJ}`;
-    const timer = $('timer');
-    timer.textContent = fmtTime(S.timer);
-    timer.classList.toggle('low', S.phase === PHASE.LIVE && S.timer < 15);
-    const w = WEAPONS[p.weapon];
-    $('weaponname').textContent = w.name;
-    const reloading = now < p.reloadingUntil;
-    $('ammo').innerHTML = reloading
-      ? '—— <small>reloading</small>'
-      : `${p.mag} <small>/ ${p.reserve}</small>`;
-    $('grenades').textContent =
-      `Frag ${p.grenades.frag} · Smoke ${p.grenades.smoke} · Flash ${p.grenades.flash}` +
-      (p.hasBomb ? ' · BOMB — plant at A or B (hold E)' : '');
-    // Bomb status bar.
-    const bs = $('bombstatus');
-    if (S.bomb.state === 'planted') {
-      bs.classList.add('on');
-      $('bombsite').textContent = S.bomb.site;
-      $('bombfill').style.width = `${(S.bomb.timer / BOMB_TIMER) * 100}%`;
-    } else {
-      bs.classList.remove('on');
-    }
-    // Crosshair gap grows with spread; hidden while a menu is open.
-    const ch = $('crosshair');
-    const gap = 4 + spreadDeg * 2.2;
-    const len = 9;
-    ch.innerHTML =
-      `<span class="l" style="left:-${gap + len}px;top:-1px;width:${len}px;height:2px"></span>` +
-      `<span class="l" style="left:${gap}px;top:-1px;width:${len}px;height:2px"></span>` +
-      `<span class="l" style="left:-1px;top:-${gap + len}px;width:2px;height:${len}px"></span>` +
-      `<span class="l" style="left:-1px;top:${gap}px;width:2px;height:${len}px"></span>` +
-      `<span class="dot"></span>`;
-    // Hitmarker fades after 130 ms.
-    $('hitmarker').style.display = now - this.hitAt < 0.13 ? 'block' : 'none';
-    // Banner fades after its time.
-    $('banner').style.display = now < this.bannerUntil ? 'block' : 'none';
-    // Low-health vignette.
-    $('vignette').style.opacity = p.hp < 35 && p.alive ? String(0.35 + (35 - p.hp) / 60) : '0';
-    // Flash overlay.
-    const flashLeft = p.blindUntil - now;
-    $('flash').style.opacity = flashLeft > 0 ? String(Math.min(1, flashLeft)) : '0';
-    // Plant / defuse prompt.
-    const pr = $('prompt');
-    if (S.phase === PHASE.LIVE && p.alive) {
-      if (p.planting > 0) {
-        pr.classList.add('on');
-        pr.textContent = `Planting… ${Math.ceil(((p.plantProgress ?? 0) / PLANT_TIME) * 100)}%`;
-      } else if (p.defusing > 0) {
-        pr.classList.add('on');
-        pr.textContent = `Defusing… ${Math.ceil(((p.defuseProgress ?? 0) / DEFUSE_TIME) * 100)}%`;
-      } else if (p.hasBomb && this.inSite(p)) {
-        pr.classList.add('on');
-        pr.textContent = 'Hold E to plant the bomb';
-      } else if (S.bomb.state === 'planted' && Math.hypot(p.x - S.bomb.x, p.z - S.bomb.z) < 2.6) {
-        pr.classList.add('on');
-        pr.textContent = 'Hold E to defuse the bomb';
-      } else if (S.bomb.state === 'dropped' && Math.hypot(p.x - S.bomb.x, p.z - S.bomb.z) < 3) {
-        pr.classList.add('on');
-        pr.textContent = 'Bomb dropped here — walk over it to pick it up';
-      } else {
-        pr.classList.remove('on');
-      }
-    } else {
-      pr.classList.remove('on');
-    }
-    this.drawKillfeed();
-    this.drawMinimap();
-  }
-
-  inSite(p) {
-    return Object.values(this.map.sites).some(
-      (s) => p.x >= s.x0 && p.x <= s.x1 && p.z >= s.z0 && p.z <= s.z1,
-    );
-  }
-
-  drawKillfeed() {
-    const el = $('killfeed');
-    el.innerHTML = this.S.killfeed
-      .map((k) => {
-        const kc = this.S.actors.find((a) => a.id === k.killer)?.team === 'V' ? 'kf-v' : 'kf-j';
-        const vc = this.S.actors.find((a) => a.id === k.victim)?.team === 'V' ? 'kf-v' : 'kf-j';
-        return `<div><span class="${kc}">${k.killer}</span> ${k.headshot ? '<span class="kf-head">◎</span> ' : ''}${k.weaponName} <span class="${vc}">${k.victim}</span></div>`;
-      })
-      .join('');
-  }
-
-  drawMinimap() {
-    const g = this.mm;
-    const b = this.map.bounds;
-    const sx = this.mmW / (b.maxX - b.minX);
-    const sz = this.mmH / (b.maxZ - b.minZ);
-    const X = (x) => (x - b.minX) * sx;
-    const Z = (z) => (z - b.minZ) * sz;
-    g.clearRect(0, 0, this.mmW, this.mmH);
-    g.fillStyle = 'rgba(20,26,38,0.9)';
-    g.fillRect(0, 0, this.mmW, this.mmH);
-    // Walls.
-    g.fillStyle = '#5a6274';
-    for (const s of this.map.solids) {
-      if (s.top < 2) continue;
-      g.fillRect(X(s.x0), Z(s.z0), (s.x1 - s.x0) * sx, (s.z1 - s.z0) * sz);
-    }
-    // Sites.
-    g.font = 'bold 11px system-ui, sans-serif';
-    g.textAlign = 'center';
-    for (const [key, s] of Object.entries(this.map.sites)) {
-      g.fillStyle = key === 'A' ? '#ffb454' : '#6ea8ff';
-      g.fillText(key, X(s.cx), Z(s.cz) + 4);
-    }
-    // Bomb.
-    if (this.S.bomb.state === 'planted' || this.S.bomb.state === 'dropped') {
-      g.fillStyle = '#ff5d5d';
-      g.beginPath();
-      g.arc(X(this.S.bomb.x), Z(this.S.bomb.z), 4, 0, Math.PI * 2);
-      g.fill();
-    }
-    // Actors: triangles for the player, dots for the rest.
-    for (const a of this.S.actors) {
-      if (!a.alive) continue;
-      g.fillStyle = a.team === 'V' ? '#6ea8ff' : '#ffb454';
-      if (a.isPlayer) {
-        const px = X(a.x);
-        const pz = Z(a.z);
-        g.save();
-        g.translate(px, pz);
-        g.rotate(Math.atan2(-Math.sin(a.yaw), -Math.cos(a.yaw)) + Math.PI / 2);
-        g.beginPath();
-        g.moveTo(0, -6);
-        g.lineTo(4, 5);
-        g.lineTo(-4, 5);
-        g.closePath();
-        g.fill();
-        g.restore();
-      } else {
-        g.beginPath();
-        g.arc(X(a.x), Z(a.z), 3, 0, Math.PI * 2);
-        g.fill();
-      }
-    }
-  }
-
-  banner(html, now, dur = 2.6) {
-    $('banner').innerHTML = html;
-    this.bannerUntil = now + dur;
-  }
-
-  hitmark(headshot, now) {
-    this.hitAt = now;
-    $('hitmarker').className = headshot ? 'head' : '';
-    $('hitmarker').id = 'hitmarker';
-  }
-
-  /** Build the buy menu for the player's current money and loadout. */
-  openBuy() {
-    const grid = $('buygrid');
-    const p = this.S.player;
-    $('buyMoney').textContent = `$${p.money}`;
-    grid.innerHTML = '';
-    buyOptions(p).forEach((item, i) => {
-      const div = document.createElement('div');
-      div.className = 'buyitem' + (item.owned ? ' owned' : '') + (!item.afford && !item.owned ? ' poor' : '');
-      div.innerHTML = `${i + 1}. ${item.name}<b>$${item.price}</b>`;
-      div.onclick = () => this.buyClicked(item.id);
-      grid.appendChild(div);
+export function initHud(ui) {
+  const grid = $('buygrid');
+  BUY_ITEMS.forEach((it, i) => {
+    const d = document.createElement('div');
+    d.className = 'buyitem';
+    d.innerHTML = `<span class="key">${i + 1}</span><div class="nm">${it.name}</div>` +
+      `<div class="ds">${it.desc}</div><div class="pr">$${it.price}</div>`;
+    d.addEventListener('click', () => {
+      if (ui.buyKey(it.key)) updateBuyMoney();
     });
-    this.show('buy', true);
-  }
+    grid.appendChild(d);
+  });
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Escape' && buyOpen) toggleBuy();
+    if (buyOpen && /^Digit[1-8]$/.test(e.code)) {
+      const it = BUY_ITEMS[Number(e.code.slice(5)) - 1];
+      if (it && ui.buyKey(it.key)) updateBuyMoney();
+    }
+  });
+  window.__hud = { toggleBuy, toast, flash: (v) => { flashV = Math.max(flashV, v); },
+    damage: () => { dmgV = 1; }, hitmark: (kill) => { hitT = 0.25; $('hitmark').classList.toggle('kill', kill); } };
+}
 
-  buyClicked(id) {
-    // Filled in by boot.js (it owns the purchase call + sound).
-    if (this.onBuy) this.onBuy(id);
-    this.openBuy();
+export function toggleBuy() {
+  if (S.phase !== 'buy') { closeBuy(); return; }
+  buyOpen = !buyOpen;
+  $('buymenu').style.display = buyOpen ? 'flex' : 'none';
+  if (buyOpen) {
+    updateBuyMoney();
+    if (document.pointerLockElement) document.exitPointerLock();
   }
+}
+export function closeBuy() {
+  buyOpen = false;
+  $('buymenu').style.display = 'none';
+}
+function updateBuyMoney() { setText('buyMoney', `You have $${S.money}`); }
 
-  closeBuy() {
-    this.show('buy', false);
-  }
+export function toast(text, secs) {
+  setText('toast', text);
+  toastT = secs || 2.5;
+}
 
-  showRoundEnd(winner, reason, scores, kills) {
-    $('reTitle').textContent = winner === 'V' ? 'Round won — VANGUARD takes it' : 'Round lost — JACKALS take it';
-    $('reSub').textContent = reason;
-    $('scores').innerHTML = kills
-      .map((k) => `<div class="row"><span>${k.id} ${k.team === 'V' ? '(VANGUARD)' : '(JACKALS)'}</span><span>${k.kills} kills · ${k.deaths} deaths</span></div>`)
-      .join('');
-    this.show('roundEnd', true);
+// --- minimap: static base (streets + sites) drawn once, dots per frame ---
+let mapBase = null;
+function buildMapBase() {
+  const c = document.createElement('canvas');
+  c.width = 392; c.height = 392;
+  const g = c.getContext('2d');
+  const b = MAP.bounds;
+  const sx = (x) => (x - b.x0) / (b.x1 - b.x0) * 392;
+  const sz = (z) => (z - b.z0) / (b.z1 - b.z0) * 392;
+  g.fillStyle = '#14181f'; g.fillRect(0, 0, 392, 392);
+  // Streets: light asphalt over the dark base.
+  g.fillStyle = '#3d434c';
+  g.fillRect(sx(-40), sz(-26), sx(40) - sx(-40), sz(-16) - sz(-26)); // A-long
+  g.fillRect(sx(-40), sz(16), sx(40) - sx(-40), sz(26) - sz(16));   // B-long
+  g.fillRect(sx(-42), sz(-5), sx(42) - sx(-42), sz(5) - sz(-5));     // mid
+  g.fillRect(sx(-18), sz(-27), sx(-8) - sx(-18), sz(27) - sz(-27)); // west cross
+  g.fillRect(sx(8), sz(-27), sx(18) - sx(8), sz(27) - sz(-27));     // east cross
+  g.fillRect(sx(24), sz(-26), sx(40) - sx(24), sz(-12) - sz(-26));  // site A yard
+  g.fillRect(sx(24), sz(12), sx(40) - sx(24), sz(26) - sz(12));     // site B plaza
+  // Buildings as darker blocks.
+  g.fillStyle = '#232830';
+  for (const s of MAP.solids) {
+    if (s.kind !== 'brick') continue;
+    g.fillRect(sx(s.x0), sz(s.z0), sx(s.x1) - sx(s.x0), sz(s.z1) - sz(s.z0));
   }
+  // Sites.
+  for (const [k, site] of Object.entries(MAP.sites)) {
+    g.strokeStyle = k === 'A' ? '#ffb35c' : '#7db8ff';
+    g.lineWidth = 3;
+    g.beginPath();
+    g.arc(sx((site.x0 + site.x1) / 2), sz((site.z0 + site.z1) / 2), 16, 0, Math.PI * 2);
+    g.stroke();
+    g.fillStyle = '#fff'; g.font = 'bold 15px Arial'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillText(k, sx((site.x0 + site.x1) / 2), sz((site.z0 + site.z1) / 2));
+  }
+  mapBase = c;
+}
 
-  showMatchEnd(winner, scores, kills) {
-    $('meTitle').textContent =
-      winner === null ? 'Match drawn' : winner === 'V' ? 'MATCH WON — VANGUARD takes Yard 7' : 'MATCH LOST — JACKALS take Yard 7';
-    $('meSub').textContent = `Final score: VANGUARD ${scores.V} — ${scores.J} JACKALS. First to 8.`;
-    $('scores2').innerHTML = kills
-      .map((k) => `<div class="row"><span>${k.id} ${k.team === 'V' ? '(VANGUARD)' : '(JACKALS)'}</span><span>${k.kills} kills · ${k.deaths} deaths</span></div>`)
-      .join('');
-    this.show('matchEnd', true);
+function drawMinimap() {
+  const cv = $('minimap');
+  const g = cv.getContext('2d');
+  if (!mapBase) buildMapBase();
+  const b = MAP.bounds;
+  const sx = (x) => (x - b.x0) / (b.x1 - b.x0) * 392;
+  const sz = (z) => (z - b.z0) / (b.z1 - b.z0) * 392;
+  g.clearRect(0, 0, 392, 392);
+  g.drawImage(mapBase, 0, 0);
+  const p = player();
+  // Enemies spotted by the player show for 3 s after last sighting.
+  for (const a of S.actors) {
+    if (!a.alive || a.team === p.team) continue;
+    if (a.id in spotted && S.time < spotted[a.id]) continue;
+    const seen = !segmentBlocked(p.x, p.y + 1.5, p.z, a.x, a.y + 1, a.z, MAP.solids, null);
+    if (seen) spotted[a.id] = S.time + 3;
   }
+  for (const a of S.actors) {
+    if (!a.alive) continue;
+    const x = sx(a.x), y = sz(a.z);
+    if (a.isPlayer) {
+      g.save();
+      g.translate(x, y); g.rotate(-a.yaw + Math.PI / 2);
+      g.fillStyle = '#fff';
+      g.beginPath(); g.moveTo(0, -9); g.lineTo(6, 7); g.lineTo(-6, 7); g.closePath(); g.fill();
+      g.restore();
+    } else if (a.team === 'azure') {
+      g.fillStyle = '#5aa2ff';
+      g.beginPath(); g.arc(x, y, 5, 0, Math.PI * 2); g.fill();
+    } else if (S.time < (spotted[a.id] || 0)) {
+      g.fillStyle = '#ff5a4e';
+      g.beginPath(); g.arc(x, y, 5, 0, Math.PI * 2); g.fill();
+    }
+  }
+  // Bomb: orange diamond when planted or dropped.
+  if (S.bomb.state === 'planted' || S.bomb.state === 'dropped') {
+    g.fillStyle = '#ffb35c';
+    const x = sx(S.bomb.x), y = sz(S.bomb.z);
+    g.save(); g.translate(x, y); g.rotate(Math.PI / 4);
+    g.fillRect(-5, -5, 10, 10); g.restore();
+  }
+}
+
+export function updateHud(dt) {
+  const p = player();
+  // Score + timer.
+  setText('scoreAn', String(S.scoreA));
+  setText('scoreBn', String(S.scoreB));
+  let t = 0;
+  if (S.phase === 'buy') t = Math.max(0, 12 - S.phaseT);
+  else if (S.phase === 'live') t = S.bomb.state === 'planted' ? S.bomb.timer : Math.max(0, S.roundTime);
+  else t = Math.max(0, S.roundTime);
+  const mm = Math.floor(t / 60), ss = Math.floor(t % 60);
+  setText('timer', `${mm}:${String(ss).padStart(2, '0')}`);
+  $('timer').classList.toggle('low', t < 10 && S.phase === 'live');
+  setText('roundinfo', `ROUND ${Math.max(1, S.round)} · SITE ${S.targetSite}`);
+  setHtml('objline', S.bomb.state === 'planted'
+    ? `Bomb planted at <b>Site ${S.bomb.site}</b> — defend it`
+    : `Round ${Math.max(1, S.round)} — target <b>Site ${S.targetSite}</b>`);
+
+  // Health / ammo / money.
+  const hp = Math.max(0, Math.ceil(p.hp));
+  $('hpbar').style.width = hp + '%';
+  $('hpbar').classList.toggle('hurt', hp <= 35);
+  setHtml('hpnum', `${hp} <small>HP</small>`);
+  const w = WEAPONS[p.weapon];
+  setHtml('mag', `${p.mag} <small>/ ${p.reserve}</small>`);
+  setText('weapon', w.name + (p.reloading > 0 ? ' — reloading…' : ''));
+  setText('money', `$${S.money}`);
+  $('bombtag').style.display = p.hasBomb ? 'block' : 'none';
+  // Slots: 1 sidearm, 2 primary, 3 grenade, 4 kevlar.
+  const slots = document.querySelectorAll('#slots .slot');
+  const hasPrimary = p.weapon !== 'p9' || (p.ammoBag && Object.keys(p.ammoBag).some((k) => k !== 'p9'));
+  const hasNade = (p.grenades.frag || 0) + (p.grenades.smoke || 0) + (p.grenades.flash || 0) > 0;
+  slots[0].classList.toggle('on', p.weapon === 'p9');
+  slots[1].classList.toggle('on', p.weapon !== 'p9');
+  slots[1].style.opacity = hasPrimary ? 1 : 0.35;
+  slots[2].classList.toggle('on', hasNade);
+  slots[3].classList.toggle('on', p.kevlar);
+
+  // Crosshair gap follows spread + recoil.
+  const gap = 7 + p.spread * 260 + p.recoil * 260;
+  $('chL').style.right = gap + 'px'; $('chR').style.left = gap + 'px';
+  $('chT').style.bottom = gap + 'px'; $('chB').style.top = gap + 'px';
+  $('cross').style.opacity = (S.phase === 'live' && p.alive) ? 1 : 0;
+
+  // Killfeed.
+  setHtml('killfeed', S.kills.slice(-4).map((k) =>
+    `<div><span class="${k.ta === 'azure' ? 'ka' : 'kb'}">${k.a}</span> ` +
+    `<span class="kw">× ${k.w}</span> <span class="${k.tb === 'azure' ? 'ka' : 'kb'}">${k.b}</span></div>`).join(''));
+
+  // Banner / plant bar / bomb warning.
+  const banner = $('banner');
+  if (S.phase === 'end' && S.banner.big) {
+    banner.style.display = 'block';
+    setText('bannerBig', S.banner.big);
+    $('bannerBig').className = 'big ' + S.banner.cls;
+    setText('bannerSub', S.banner.sub);
+  } else {
+    banner.style.display = 'none';
+  }
+  const planting = p.planting || p.defusing;
+  $('plantbar').style.display = planting ? 'block' : 'none';
+  if (planting) {
+    setText('plantLbl', p.planting ? 'PLANTING…' : 'DEFUSING…');
+    $('plantFill').style.width = ((p.planting ? p.plantT / 3.5 : p.defuseT / 5) * 100) + '%';
+  }
+  $('bombwarn').style.display = S.bomb.state === 'planted' ? 'block' : 'none';
+
+  // Flash + damage overlays decay.
+  if (flashV > 0) { flashV = Math.max(0, flashV - dt * 1.4); $('flash').style.opacity = flashV; }
+  if (dmgV > 0) { dmgV = Math.max(0, dmgV - dt * 1.8); $('dmg').style.opacity = dmgV; }
+  if (hitT > 0) {
+    hitT -= dt;
+    $('hitmark').style.opacity = Math.max(0, hitT / 0.25);
+  }
+  if (toastT > 0) {
+    toastT -= dt;
+    if (toastT <= 0) setText('toast', '');
+  }
+  drawMinimap();
 }
