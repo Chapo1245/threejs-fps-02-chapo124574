@@ -1,264 +1,350 @@
-// bots.js — the nine AI teammates and opponents.
-// Bots think at 10 Hz and steer every step. They follow waypoint routes
-// (BFS over the map graph), hold sites, react to sight and sound, plant
-// and defuse the bomb, and fight in bursts with skill-based aim error.
-// Decisions live here; movement integration lives in sim.js.
+// bots.js — bot AI: waypoint routes, hold positions, vision cones,
+// hearing, burst fire, bomb plant / defuse / retake.
+// Bots share what they see (lastKnown) with a 1s delay, react after a
+// human-like delay, and fire the same combat.fire path as the player,
+// so bot accuracy is honest, not scripted damage.
 
-import { S, aliveCount, eyeHeight } from './sim.js';
-import { MAP, bfsPath, nearestNode } from './mapdata.js';
-import { botShoot, equipWeapon, refillWeapon } from './combat.js';
-import { angleDiff, clamp, dist2, segmentBlocked } from './util.js';
+import * as THREE from 'three';
+import { WEAPONS } from './config.js';
+import { clamp } from './state.js';
+import { makeLoadout, initAmmo, currentWeapon, tickLoadout, tryFire, startReload, currentSpread } from './weapons.js';
 
-const THINK_HZ = 0.1;
+const BOT_SPEED = 4.3;
+const SCAN_INTERVAL = 0.14;
+const VIEW_DIST = 48;
+const FOV_COS = 0.45; // ~63 deg half-angle
 
-// Assign routes and holds at the start of a round. Attackers split across
-// lanes toward the target site; defenders hold both sites plus mid.
-export function assignRoles() {
-  const target = S.targetSite;
-  const attackers = S.actors.filter((a) => a.team === 'azure' && !a.isPlayer);
-  const defenders = S.actors.filter((a) => a.team === 'rust');
-  const laneRoutes = target === 'A'
-    ? ['A', 'A', 'Amid', 'Bmid']
-    : ['B', 'B', 'Bmid', 'Amid'];
-  attackers.forEach((b, i) => {
-    const key = laneRoutes[i % laneRoutes.length];
-    b.route = [...MAP.routes[key]];
-    b.routeIdx = 0;
-    b.botState = 'route';
-    buyBotWeapon(b);
-  });
-  const holds = [...MAP.holds.A, ...MAP.holds.B, ...MAP.holds.mid];
-  defenders.forEach((b, i) => {
-    b.hold = holds[i % holds.length];
-    b.route = [];
-    b.botState = 'hold';
-    buyBotWeapon(b);
-    if (S.rng() < 0.5) b.kevlar = true;
-  });
-}
+const _v = { x: 0, z: 0 };
 
-function buyBotWeapon(b) {
-  const r = S.rng();
-  const key = r < 0.55 ? 'ar51' : r < 0.8 ? 'hornet' : 'longbow';
-  equipWeapon(b, key);
-  refillWeapon(b, key);
-}
-
-// Nearest waypoint route from the bot's position to a waypoint id.
-function routeTo(b, nodeId) {
-  const from = nearestNode(b.x, b.z);
-  const path = bfsPath(from, nodeId);
-  if (!path) return false;
-  b.route = path; b.routeIdx = 0;
-  return true;
-}
-
-function canSee(a, b) {
-  const dx = b.x - a.x, dz = b.z - a.z;
-  const dist2v = dx * dx + dz * dz;
-  if (dist2v > 48 * 48) return false;
-  const eyeY = a.y + eyeHeight(a);
-  const chestY = b.y + eyeHeight(b) - 0.55;
-  return !segmentBlocked(a.x, eyeY, a.z, b.x, chestY, b.z, MAP.solids,
-    S.smokes.map((s) => ({ x: s.x, y: s.y, z: s.z, r: s.r })));
-}
-
-function visibleEnemy(b) {
-  let best = null, bd = Infinity;
-  for (const a of S.actors) {
-    if (!a.alive || a.team === b.team) continue;
-    const dx = a.x - b.x, dz = a.z - b.z;
-    const d2 = dx * dx + dz * dz;
-    if (d2 > bd) continue;
-    const want = Math.atan2(dz, dx);
-    if (Math.abs(angleDiff(want, b.yaw)) > 1.15) continue; // ~132 deg FOV
-    if (!canSee(b, a)) continue;
-    best = a; bd = d2;
+export class Bots {
+  constructor(S, world, render, sfx, combat, hooks) {
+    this.S = S;
+    this.world = world;
+    this.render = render;
+    this.sfx = sfx;
+    this.combat = combat;
+    this.hooks = hooks;
+    this.list = [];
   }
-  return best;
-}
 
-function think(b, dt) {
-  b.thinkT -= dt;
-  if (b.thinkT > 0) return;
-  b.thinkT = THINK_HZ;
-  if (b.blindT > 0) { b.moveX = 0; b.moveZ = 0; return; }
-  const enemy = visibleEnemy(b);
-  if (enemy) {
-    b.target = enemy; b.lastSeen = S.time;
-    b.botState = 'engage';
-    return;
+  spawnRound(planSite, difficulty) {
+    const S = this.S;
+    const layout = this.world.layout;
+    const variant = S.variantCfg;
+    // Reuse meshes across rounds; create once.
+    if (this.list.length === 0) {
+      for (let i = 0; i < 9; i++) {
+        const team = i < 4 ? 'atk' : 'def';
+        const mesh = this.render.makeBotMesh(team);
+        this.render.scene.add(mesh);
+        this.list.push({ mesh, team, id: i });
+      }
+    }
+    const atkGuns = ['rifle', 'rifle', 'smg', 'shotgun'];
+    const defGuns = ['rifle', 'rifle', 'sniper', 'smg', 'rifle'];
+    const atkRoutes = planSite === 'A'
+      ? ['atkA', 'atkMid', 'atkB', 'atkA']
+      : ['atkB', 'atkMid', 'atkA', 'atkB'];
+    const defHolds = ['defA', 'defB', 'defMid', 'defA', 'defB'];
+    S.bots = this.list;
+    for (let i = 0; i < 9; i++) {
+      const b = this.list[i];
+      const isAtk = i < 4;
+      const spawn = isAtk ? layout.spawns.atk[i + 1] : layout.spawns.def[i - 4];
+      b.name = isAtk ? S.atkNames[i] : S.defNames[i - 4];
+      b.pos = { x: spawn.x, y: 0, z: spawn.z };
+      b.vel = { x: 0, z: 0 };
+      b.yaw = spawn.yaw;
+      b.hp = 100; b.armor = isAtk ? 0 : 25;
+      b.alive = true;
+      b.loadout = makeLoadout(isAtk ? atkGuns[i] : defGuns[i - 4]);
+      initAmmo(b.loadout);
+      for (const k of Object.keys(b.loadout.ammo)) b.loadout.ammo[k].reserve = 999;
+      b.role = isAtk ? atkRoutes[i] : defHolds[i - 4];
+      b.route = layout.routes[b.role].slice();
+      b.routeIdx = 0;
+      b.state = 'move';
+      b.target = null;
+      b.lastSeen = null;
+      b.lastKnownShared = null;
+      b.reactT = 0;
+      b.scanT = 0.1 + i * 0.02;
+      b.burstLeft = 0;
+      b.burstPause = 0;
+      b.fireT = 0;
+      b.strafeDir = 1;
+      b.strafeT = 0;
+      b.holdNode = null;
+      b.isCarrier = false;
+      b.channel = null; // {kind:'plant'|'defuse', t, dur}
+      b.hearT = -99;
+      // Difficulty scales the variant's bot profile per bot.
+      const dm = S.difficulty === 'hard' ? { r: 0.85, a: 1.12 } : S.difficulty === 'easy' ? { r: 1.3, a: 0.85 } : { r: 1, a: 1 };
+      b.skill = {
+        reaction: variant.bot.reaction * dm.r,
+        accuracy: clamp(variant.bot.accuracy * dm.a, 0.1, 0.9),
+        aggression: variant.bot.aggression,
+        holdBias: variant.bot.holdBias,
+      };
+      b.aimErr = 0;
+      b.mesh.visible = true;
+      b.mesh.rotation.set(0, b.yaw, 0);
+      b.mesh.position.set(b.pos.x, 0, b.pos.z);
+      b.mesh.scale.set(1, 1, 1);
+      b.fallT = 0;
+    }
+    // Attackers pick a site plan; defenders spread to holds.
+    S.planSite = planSite;
   }
-  // Lost the target a moment ago: keep facing the last seen spot.
-  if (b.target && S.time - b.lastSeen < 1.2) { b.botState = 'engage'; return; }
-  b.target = null;
 
-  const bomb = S.bomb;
-  if (bomb.state === 'planted') {
-    if (b.team === 'rust') {
-      // Retake: converge on the planted site and defuse when close.
-      if (dist2(b.x, b.z, bomb.x, bomb.z) < 2.6) {
-        b.botState = 'defuse';
-        b.defusing = true;
-        b.moveX = 0; b.moveZ = 0;
+  // One bot's scan: nearest visible enemy, plus hearing.
+  _scan(b, dt) {
+    const S = this.S;
+    b.scanT -= dt;
+    if (b.scanT > 0) return;
+    b.scanT = SCAN_INTERVAL;
+    const eyeY = 1.55;
+    let best = null, bestD = Infinity;
+    for (let i = 0; i < S.targets.length; i++) {
+      const tg = S.targets[i];
+      if (!tg.alive || tg.team === b.team) continue;
+      const dx = tg.x - b.pos.x, dz = tg.z - b.pos.z;
+      const d = Math.hypot(dx, dz);
+      if (d > VIEW_DIST || d < 0.4) continue;
+      if (d > 3) {
+        // FOV check against facing.
+        const fx = -Math.sin(b.yaw), fz = -Math.cos(b.yaw);
+        if ((dx * fx + dz * fz) / d < FOV_COS) continue;
+      }
+      if (!this.world.hasLOS(b.pos.x, eyeY, b.pos.z, tg.x, 1.45, tg.z, S.smokes)) continue;
+      if (d < bestD) { bestD = d; best = tg; }
+    }
+    if (best) {
+      if (b.target !== best.ref) {
+        // First sight: reaction delay before the first shot.
+        b.reactT = b.skill.reaction * (0.8 + S.rng() * 0.5);
+        b.burstLeft = 0; b.burstPause = 0;
+      }
+      b.target = best.ref;
+      b.lastSeen = { x: best.x, z: best.z, t: S.time };
+      b.lastKnownShared = { x: best.x, z: best.z, t: S.time };
+    } else {
+      b.target = null;
+    }
+    // Hearing: enemy shots within 28m reveal a position (no exact aim).
+    for (let i = 0; i < S.shotEvents.length; i++) {
+      const ev = S.shotEvents[i];
+      if (ev.t <= b.hearT || ev.team === b.team) continue;
+      const d = Math.hypot(ev.x - b.pos.x, ev.z - b.pos.z);
+      if (d < 28) {
+        b.hearT = ev.t;
+        b.lastSeen = { x: ev.x + (S.rng() - 0.5) * 4, z: ev.z + (S.rng() - 0.5) * 4, t: S.time };
+      }
+    }
+  }
+
+  update(dt) {
+    const S = this.S;
+    for (const b of this.list) {
+      if (!b.alive) {
+        if (b.fallT > 0) {
+          b.fallT -= dt;
+          b.mesh.rotation.x = Math.min(Math.PI / 2, b.mesh.rotation.x + dt * 5);
+          if (b.fallT <= 0) b.mesh.visible = false;
+        }
+        continue;
+      }
+      this._scan(b, dt);
+      tickLoadout(b.loadout, dt);
+      // Channel (plant/defuse): stand still, abort if an enemy is close.
+      if (b.channel) {
+        const ch = b.channel;
+        ch.t += dt;
+        let near = false;
+        if (b.target && b.target.alive) {
+          const tx = b.target.pos ? b.target.pos.x : b.target.x;
+          const tz = b.target.pos ? b.target.pos.z : b.target.z;
+          near = Math.hypot(tx - b.pos.x, tz - b.pos.z) < 8;
+        }
+        if (near) { b.channel = null; }
+        else if (ch.t >= ch.dur) {
+          this.hooks.onChannelDone(b, ch.kind);
+          b.channel = null;
+        }
+        this._faceTarget(b, dt);
+        this._syncMesh(b, dt, 0);
+        continue;
+      }
+      if (b.target && b.target.alive) {
+        this._engage(b, dt);
+      } else {
+        this._objective(b, dt);
+      }
+      this._syncMesh(b, dt, Math.hypot(b.vel.x, b.vel.z));
+    }
+  }
+
+  _faceTarget(b, dt) {
+    if (!b.target) return;
+    const tx = b.target.pos ? b.target.pos.x : b.target.x;
+    const tz = b.target.pos ? b.target.pos.z : b.target.z;
+    const want = Math.atan2(-(tx - b.pos.x), -(tz - b.pos.z));
+    let d = want - b.yaw;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    b.yaw += clamp(d, -dt * 7, dt * 7);
+  }
+
+  _engage(b, dt) {
+    const S = this.S;
+    const t = b.target;
+    const tx = t.pos ? t.pos.x : t.x;
+    const tz = t.pos ? t.pos.z : t.z;
+    const dist = Math.hypot(tx - b.pos.x, tz - b.pos.z);
+    this._faceTarget(b, dt);
+    // Strafe while fighting; close distance if far, hold if close.
+    b.strafeT -= dt;
+    if (b.strafeT <= 0) { b.strafeDir = S.rng() < 0.5 ? -1 : 1; b.strafeT = 0.5 + S.rng() * 0.6; }
+    const fx = -Math.sin(b.yaw), fz = -Math.cos(b.yaw);
+    let mx = 0, mz = 0;
+    if (dist > 14) { mx = fx; mz = fz; }
+    else if (dist < 5) { mx = -fx * 0.5; mz = -fz * 0.5; }
+    mx += -fz * b.strafeDir * 0.7; mz += fx * b.strafeDir * 0.7;
+    this._move(b, mx, mz, dt, BOT_SPEED * 0.55);
+    // Burst fire after the reaction delay.
+    b.reactT -= dt;
+    if (b.reactT > 0) return;
+    const w = currentWeapon(b.loadout);
+    if (!w) return;
+    b.burstPause -= dt;
+    if (b.burstLeft <= 0 && b.burstPause <= 0) {
+      b.burstLeft = 3 + ((S.rng() * 3) | 0);
+      b.burstPause = 0.55 + S.rng() * 0.55;
+    }
+    b.fireT -= dt;
+    if (b.burstLeft > 0 && b.fireT <= 0) {
+      b.fireT = w.interval * (1 + (1 - b.skill.accuracy) * 0.6);
+      const res = tryFire(b.loadout, w, null);
+      if (res === 'fired') {
+        b.burstLeft -= 1;
+        // Aim at chest, sometimes head, with skill-based error.
+        const head = S.rng() < 0.14;
+        const aimY = head ? 1.62 : 1.1;
+        const err = (1 - b.skill.accuracy) * 0.055 + dist * 0.0009 + (t.moveMag || 0) * 0.02;
+        const dx = tx - b.pos.x, dy = aimY - 1.55, dz = tz - b.pos.z;
+        const len = Math.hypot(dx, dy, dz) || 1;
+        const spread = currentSpread(w, 0.4, false, b.loadout.bloom, false) + err;
+        const origin = { x: b.pos.x, y: 1.55, z: b.pos.z };
+        const dir = { x: dx / len, y: dy / len, z: dz / len };
+        this.combat.fire(b, origin, dir, w, spread, S.rng, false);
+        this.render.muzzleFlashAt(origin);
+      } else if (res === 'dry') {
+        // Bot reloads on empty.
+        startReload(b.loadout, null);
+      }
+    }
+  }
+
+  _objective(b, dt) {
+    const S = this.S;
+    const layout = this.world.layout;
+    // Bomb planted: attackers defend the site, defenders retake.
+    if (S.bomb.planted) {
+      if (b.team === 'def') {
+        const site = layout.sites[S.bomb.site];
+        const d = Math.hypot(site.x - b.pos.x, site.z - b.pos.z);
+        if (d < 2.2) {
+          if (!b.channel) {
+            b.channel = { kind: 'defuse', t: 0, dur: S.defuseTime };
+            this.sfx.defuseBeep();
+          }
+          return;
+        }
+        this._followRoute(b, layout.routes[S.bomb.site === 'A' ? 'retakeA' : 'retakeB'], dt);
         return;
       }
-      b.defusing = false;
-      const node = b.team === 'rust'
-        ? nearestNode(bomb.x, bomb.z) : 0;
-      if (!b.route.length || b.routeIdx >= b.route.length) {
-        routeTo(b, bomb.site === 'A' ? 12 : 18);
-        b.botState = 'retake';
-      }
+      // Attackers: hold near the planted site.
+      const site = layout.sites[S.bomb.site];
+      const d = Math.hypot(site.x - b.pos.x, site.z - b.pos.z);
+      if (d > 6) { this._steerTo(b, site.x, site.z, dt, BOT_SPEED * 0.8); return; }
+      this._holdScan(b, dt);
       return;
     }
-    // Attackers defend the planted bomb from nearby cover.
-    if (!b.hold) {
-      b.hold = [clamp(bomb.x + (S.rng() - 0.5) * 6, 24, 40),
-        clamp(bomb.z + (S.rng() - 0.5) * 6, -26, 26), S.rng() * 6.28];
-    }
-    b.botState = 'hold';
-    return;
-  }
-  b.defusing = false;
-
-  if (b.team === 'azure') {
-    if (b.hasBomb) {
-      // The carrier pushes to the target site, then plants.
-      const site = MAP.sites[S.targetSite];
-      if (b.x >= site.x0 && b.x <= site.x1 && b.z >= site.z0 && b.z <= site.z1) {
-        const near = S.actors.some((a) => a.alive && a.team === 'rust'
-          && dist2(a.x, a.z, b.x, b.z) < 12 * 12);
-        if (!near || S.roundTime < 25) {
-          b.botState = 'plant';
-          b.planting = true;
-          b.moveX = 0; b.moveZ = 0;
+    if (b.team === 'atk') {
+      // Carrier plants when it reaches its site.
+      if (b.isCarrier) {
+        const site = layout.sites[S.planSite];
+        const d = Math.hypot(site.x - b.pos.x, site.z - b.pos.z);
+        if (d < site.r * 0.7) {
+          if (!b.channel) {
+            b.channel = { kind: 'plant', t: 0, dur: S.plantTime };
+            this.sfx.plantStart();
+          }
           return;
         }
       }
-      b.planting = false;
-      if (!b.route.length) {
-        const key = S.targetSite === 'A' ? 'A' : 'B';
-        b.route = [...MAP.routes[key]];
-        b.routeIdx = 0;
-      }
-      b.botState = 'route';
+      this._followRoute(b, b.route, dt);
       return;
     }
-    // Non-carriers follow their lane, then hold near the site.
-    if (b.routeIdx < b.route.length) { b.botState = 'route'; return; }
-    b.botState = 'hold';
-    if (!b.hold) {
-      const site = MAP.sites[S.targetSite];
-      b.hold = [site.x0 + S.rng() * 8, site.z0 + S.rng() * 6, S.rng() * 6.28];
-    }
-    return;
+    // Defenders: walk to hold, then scan.
+    if (b.holdNode !== null) { this._holdScan(b, dt); return; }
+    this._followRoute(b, b.route, dt);
   }
 
-  // Defenders: walk to the hold point, then scan.
-  if (b.hold) {
-    const d2 = dist2(b.x, b.z, b.hold[0], b.hold[1]);
-    if (d2 > 1.2) {
-      if (!b.route.length) routeTo(b, nearestNode(b.hold[0], b.hold[1]));
-      b.botState = 'route';
+  _holdScan(b, dt) {
+    // Slowly sweep the view; move to investigate lastSeen if fresh.
+    const S = this.S;
+    if (b.lastSeen && S.time - b.lastSeen.t < 6 && b.team === 'def') {
+      const d = Math.hypot(b.lastSeen.x - b.pos.x, b.lastSeen.z - b.pos.z);
+      if (d > 4) { this._steerTo(b, b.lastSeen.x, b.lastSeen.z, dt, BOT_SPEED * 0.7); return; }
+    }
+    b.yaw += dt * 0.35 * Math.sin(S.time * 0.5 + b.id);
+    this._move(b, 0, 0, dt, 0);
+  }
+
+  _followRoute(b, route, dt) {
+    if (!route || route.length === 0) { this._holdScan(b, dt); return; }
+    if (b.routeIdx >= route.length) {
+      // End of route: hold here and scan.
+      b.holdNode = route[route.length - 1];
+      this._holdScan(b, dt);
       return;
     }
-    b.botState = 'hold';
-    return;
+    const node = route[b.routeIdx];
+    this.world.nodePos(node, _v);
+    const d = Math.hypot(_v.x - b.pos.x, _v.z - b.pos.z);
+    if (d < 1.4) { b.routeIdx += 1; return; }
+    this._steerTo(b, _v.x, _v.z, dt, BOT_SPEED);
   }
 
-  // Heard a shot recently: investigate it.
-  if (S.time - b.hearT < 3) {
-    b.botState = 'investigate';
-    if (!b.route.length) routeTo(b, nearestNode(b.hearX, b.hearZ));
+  _steerTo(b, x, z, dt, speed) {
+    const dx = x - b.pos.x, dz = z - b.pos.z;
+    const len = Math.hypot(dx, dz) || 1;
+    this._move(b, dx / len, dz / len, dt, speed);
+    const want = Math.atan2(-dx, -dz);
+    let d = want - b.yaw;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    b.yaw += clamp(d, -dt * 6, dt * 6);
+  }
+
+  _move(b, mx, mz, dt, speed) {
+    const len = Math.hypot(mx, mz);
+    if (len > 0.01) { mx /= len; mz /= len; }
+    const k = Math.min(1, dt * 8);
+    b.vel.x += (mx * speed - b.vel.x) * k;
+    b.vel.z += (mz * speed - b.vel.z) * k;
+    b.pos.x += b.vel.x * dt;
+    b.pos.z += b.vel.z * dt;
+    this.world.collideCircle(b.pos, 0.38);
+  }
+
+  _syncMesh(b, dt, speed) {
+    const m = b.mesh;
+    m.position.set(b.pos.x, 0, b.pos.z);
+    m.rotation.y = b.yaw;
+    this.render.animateBot(m, speed, dt, !!b.channel);
   }
 }
 
-function steer(b, dt) {
-  if (b.blindT > 0) { b.blindT -= dt; b.moveX = 0; b.moveZ = 0; return; }
-  let tx = null, tz = null, faceYaw = null;
-  if (b.botState === 'engage' && b.target && b.target.alive) {
-    const t = b.target;
-    faceYaw = Math.atan2(t.z - b.z, t.x - b.x);
-    // Strafe sideways while fighting, changing direction every second.
-    b.strafeT = (b.strafeT || 0) - dt;
-    if (b.strafeT <= 0) { b.strafeT = 0.8 + S.rng() * 0.7; b.strafeDir = S.rng() < 0.5 ? -1 : 1; }
-    const d = Math.hypot(t.x - b.x, t.z - b.z);
-    const fwd = d > 14 ? 1 : d < 6 ? -0.6 : 0;
-    const fx = Math.cos(faceYaw), fz = Math.sin(faceYaw);
-    tx = fx * fwd * 0.7 + -fz * (b.strafeDir || 1) * 0.7;
-    tz = fz * fwd * 0.7 + fx * (b.strafeDir || 1) * 0.7;
-    // Fire in bursts with pauses.
-    b.fireT -= dt;
-    if (b.fireT <= 0) {
-      if (b.burstLeft > 0) {
-        if (botShoot(b, t)) b.burstLeft--;
-        b.fireT = 0.12;
-      } else {
-        b.burstLeft = 3 + Math.floor(S.rng() * 3);
-        b.fireT = 0.5 + S.rng() * 0.6;
-      }
-    }
-  } else if (b.botState === 'route' && b.route.length && b.routeIdx < b.route.length) {
-    const [wx, wz] = MAP.waypoints[b.route[b.routeIdx]];
-    const dx = wx - b.x, dz = wz - b.z;
-    const d = Math.hypot(dx, dz);
-    if (d < 0.9) { b.routeIdx++; b.stuckT = 0; }
-    else {
-      tx = dx / d; tz = dz / d;
-      faceYaw = Math.atan2(dz, dx);
-    }
-  } else if (b.botState === 'hold' && b.hold) {
-    const dx = b.hold[0] - b.x, dz = b.hold[1] - b.z;
-    const d = Math.hypot(dx, dz);
-    if (d > 1.2) { tx = dx / d; tz = dz / d; faceYaw = Math.atan2(dz, dx); }
-    else {
-      // Scan: slow sweep across the hold yaw.
-      faceYaw = b.hold[2] + Math.sin(S.time * 0.45 + b.id) * 0.9;
-      tx = 0; tz = 0;
-    }
-  } else if (b.botState === 'investigate') {
-    const dx = b.hearX - b.x, dz = b.hearZ - b.z;
-    const d = Math.hypot(dx, dz);
-    if (d < 1.5) { b.botState = 'hold'; b.hold = [b.x, b.z, b.yaw]; }
-    else if (b.route.length && b.routeIdx < b.route.length) {
-      const [wx, wz] = MAP.waypoints[b.route[b.routeIdx]];
-      const wdx = wx - b.x, wdz = wz - b.z;
-      const wd = Math.hypot(wdx, wdz);
-      if (wd < 0.9) b.routeIdx++;
-      else { tx = wdx / wd; tz = wdz / wd; faceYaw = Math.atan2(wdz, wdx); }
-    }
-  }
-  // Stuck detection: no progress while trying to move -> sidestep.
-  if (tx !== null && tz !== null && (tx !== 0 || tz !== 0)) {
-    const moved = Math.hypot(b.x - b.lastPosX, b.z - b.lastPosZ);
-    if (moved < 0.02) {
-      b.stuckT += dt;
-      if (b.stuckT > 1.2) {
-        b.sideT = 0.7; b.sideDir = (b.sideDir || 1) * -1; b.stuckT = 0;
-      }
-    } else b.stuckT = 0;
-    b.lastPosX = b.x; b.lastPosZ = b.z;
-    if (b.sideT > 0) {
-      b.sideT -= dt;
-      const px = -tz * b.sideDir, pz = tx * b.sideDir;
-      tx = px; tz = pz;
-    }
-    b.moveX = tx; b.moveZ = tz;
-  } else {
-    b.moveX = 0; b.moveZ = 0;
-  }
-  if (faceYaw !== null) {
-    b.yaw += angleDiff(faceYaw, b.yaw) * Math.min(1, dt * 8);
-  }
-}
-
-export function stepBots(dt) {
-  if (S.phase !== 'live' && S.phase !== 'buy') return;
-  for (const b of S.actors) {
-    if (b.isPlayer || !b.alive) continue;
-    if (S.phase === 'buy') { b.moveX = 0; b.moveZ = 0; continue; }
-    think(b, dt);
-    steer(b, dt);
-  }
-}
+// Bots keep their meshes across rounds; spawnRound only re-places them.

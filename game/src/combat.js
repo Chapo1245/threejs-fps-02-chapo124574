@@ -1,268 +1,205 @@
-// combat.js — weapons, hitscan gunplay, grenades, reload.
-// The weapon table is the game's balance sheet: damage, headshot bonus,
-// fire rate, spread and recoil per weapon. Shooting is hitscan against
-// body spheres, checked against wall AABBs first so cover actually works.
-// Visuals and sound go out through hooks that boot.js wires up; this
-// module never touches the renderer.
+// combat.js — hitscan resolution, grenades, explosions.
+// Hits are checked against bodies with a head bonus: ray vs head sphere
+// first, then ray vs body box. Walls stop bullets first (ray vs AABB).
+// No allocations in the hot path: one scratch target list, one ray.
+// Targets are plain descriptors built by main.js each tick into S.targets.
 
-import { S, applyDamage, eyeHeight } from './sim.js';
-import { MAP } from './mapdata.js';
-import { clamp, rayAABB, raySphere, segmentBlocked } from './util.js';
+import * as THREE from 'three';
+import { clamp } from './state.js';
 
-export const WEAPONS = {
-  p9: { name: 'P9 Sidearm', dmg: 26, head: 2.5, rof: 300, mag: 12, reserve: 48,
-    spread: 0.011, moveSpread: 0.018, bloom: 0.006, recoil: 0.010, kick: 0.010,
-    reloadT: 1.4, price: 0, auto: false, falloff: 45 },
-  ar51: { name: 'AR-51 Rifle', dmg: 34, head: 3, rof: 105, mag: 30, reserve: 90,
-    spread: 0.008, moveSpread: 0.016, bloom: 0.004, recoil: 0.014, kick: 0.013,
-    reloadT: 2.1, price: 2700, auto: true, falloff: 60 },
-  hornet: { name: 'Hornet-9 SMG', dmg: 25, head: 3, rof: 72, mag: 32, reserve: 96,
-    spread: 0.014, moveSpread: 0.024, bloom: 0.005, recoil: 0.010, kick: 0.009,
-    reloadT: 1.9, price: 1500, auto: true, falloff: 38 },
-  longbow: { name: 'Longbow DMR', dmg: 88, head: 3, rof: 950, mag: 5, reserve: 20,
-    spread: 0.001, moveSpread: 0.010, bloom: 0.002, recoil: 0.05, kick: 0.05,
-    reloadT: 2.6, price: 4200, auto: false, falloff: 90, zoom: 2.2 },
-  breacher: { name: 'Breacher Shotgun', dmg: 12, head: 2, rof: 780, mag: 6, reserve: 24,
-    spread: 0.05, moveSpread: 0.03, bloom: 0.008, recoil: 0.03, kick: 0.03,
-    reloadT: 2.4, price: 1800, auto: false, pellets: 8, falloff: 22 },
-};
+const _dir = new THREE.Vector3();
+const _from = new THREE.Vector3();
+const _to = new THREE.Vector3();
 
-export const GRENADE_PRICE = { frag: 300, smoke: 300, flash: 200 };
-
-// Visual/sound hooks, wired by boot.js. No-ops until then.
-export const hooks = {
-  tracer() {}, spark() {}, shotSound() {}, hitmark() {},
-  flash() {}, explode() {}, reloadSound() {},
-};
-export function setCombatHooks(h) { Object.assign(hooks, h); }
-
-export function eyePos(a) {
-  return { x: a.x, y: a.y + eyeHeight(a), z: a.z };
-}
-
-// Aim direction from yaw/pitch. Yaw 0 faces +X, pitch positive looks up.
-export function aimDir(a) {
-  const cp = Math.cos(a.pitch);
-  return {
-    x: Math.cos(a.yaw) * cp,
-    y: Math.sin(a.pitch),
-    z: Math.sin(a.yaw) * cp,
-  };
-}
-
-// Per-weapon ammo bag: switching weapons keeps each weapon's own mag and
-// reserve, so a buy is never wasted by swapping.
-export function initLoadout(a) {
-  a.ammoBag = { p9: { mag: WEAPONS.p9.mag, reserve: WEAPONS.p9.reserve } };
-  a.weapon = 'p9';
-  a.mag = WEAPONS.p9.mag; a.reserve = WEAPONS.p9.reserve;
-}
-export function equipWeapon(a, key) {
-  if (!WEAPONS[key] || a.weapon === key) return false;
-  if (a.ammoBag) a.ammoBag[a.weapon] = { mag: a.mag, reserve: a.reserve };
-  else a.ammoBag = {};
-  if (!a.ammoBag[key]) {
-    a.ammoBag[key] = { mag: WEAPONS[key].mag, reserve: WEAPONS[key].reserve };
+// Ray vs AABB (slab method). Returns nearest t >= 0 or Infinity.
+export function rayAABB(ox, oy, oz, dx, dy, dz, b) {
+  let t0 = 0, t1 = Infinity;
+  const bx0 = b.x - b.w / 2, bx1 = b.x + b.w / 2;
+  const by0 = 0, by1 = b.h;
+  const bz0 = b.z - b.d / 2, bz1 = b.z + b.d / 2;
+  const mins = [bx0, by0, bz0], maxs = [bx1, by1, bz1];
+  const o = [ox, oy, oz], d = [dx, dy, dz];
+  for (let a = 0; a < 3; a++) {
+    if (Math.abs(d[a]) < 1e-9) {
+      if (o[a] < mins[a] || o[a] > maxs[a]) return Infinity;
+    } else {
+      let ta = (mins[a] - o[a]) / d[a];
+      let tb = (maxs[a] - o[a]) / d[a];
+      if (ta > tb) { const t = ta; ta = tb; tb = t; }
+      if (ta > t0) t0 = ta;
+      if (tb < t1) t1 = tb;
+      if (t0 > t1) return Infinity;
+    }
   }
-  a.weapon = key;
-  a.mag = a.ammoBag[key].mag; a.reserve = a.ammoBag[key].reserve;
-  return true;
-}
-export function refillWeapon(a, key) {
-  if (!a.ammoBag) a.ammoBag = {};
-  a.ammoBag[key] = { mag: WEAPONS[key].mag, reserve: WEAPONS[key].reserve };
-  if (a.weapon === key) { a.mag = WEAPONS[key].mag; a.reserve = WEAPONS[key].reserve; }
+  return t0;
 }
 
-export function startReload(a) {
-  const w = WEAPONS[a.weapon];
-  if (a.reloading > 0 || a.mag >= w.mag || a.reserve <= 0) return false;
-  a.reloading = w.reloadT;
-  hooks.reloadSound(a);
-  return true;
+// Ray vs sphere. Returns t >= 0 or Infinity.
+function raySphere(ox, oy, oz, dx, dy, dz, cx, cy, cz, r) {
+  const lx = cx - ox, ly = cy - oy, lz = cz - oz;
+  const tca = lx * dx + ly * dy + lz * dz;
+  if (tca < 0) return Infinity;
+  const d2 = lx * lx + ly * ly + lz * lz - tca * tca;
+  const r2 = r * r;
+  if (d2 > r2) return Infinity;
+  return tca - Math.sqrt(r2 - d2);
 }
 
-// One hitscan pellet/shot. `dir` is the (already spread) unit direction.
-// Returns { hit, killed, point, dist }.
-function traceShot(shooter, dir) {
-  const o = eyePos(shooter);
-  let wallDist = Infinity;
-  for (const s of MAP.solids) {
-    const t = rayAABB(o.x, o.y, o.z, dir.x, dir.y, dir.z,
-      { x0: s.x0, y0: 0, z0: s.z0, x1: s.x1, y1: s.h, z1: s.z1 });
-    if (t < wallDist) wallDist = t;
+export class Combat {
+  // hooks: { onDamage(target, dmg, head, shooter), onKill(target, shooter, weaponId, head) }
+  constructor(S, world, render, sfx, hooks) {
+    this.S = S;
+    this.world = world;
+    this.render = render;
+    this.sfx = sfx;
+    this.hooks = hooks;
   }
-  let best = null;
-  for (const a of S.actors) {
-    if (!a.alive || a.team === shooter.team || a === shooter) continue;
-    const headY = a.y + eyeHeight(a) - 0.05;
-    const torsoY = a.y + eyeHeight(a) - 0.55;
-    const th = raySphere(o.x, o.y, o.z, dir.x, dir.y, dir.z, a.x, headY, a.z, 0.22);
-    const tt = raySphere(o.x, o.y, o.z, dir.x, dir.y, dir.z, a.x, torsoY, a.z, 0.42);
-    if (th < wallDist && (!best || th < best.dist)) best = { a, dist: th, head: true };
-    if (tt < wallDist && (!best || tt < best.dist)) best = { a, dist: tt, head: false };
-  }
-  const dist = best ? best.dist : Math.min(wallDist, 90);
-  const point = { x: o.x + dir.x * dist, y: o.y + dir.y * dist, z: o.z + dir.z * dist };
-  return { best, point, dist, wallDist };
-}
 
-function spreadDir(a, baseSpread) {
-  // Total spread grows when moving, airborne, or firing in a burst
-  // (bloom), and shrinks a lot while aiming down sights: stopping to
-  // aim genuinely pays.
-  const speed = Math.hypot(a.vx, a.vz);
-  let sp = baseSpread * (1 + (speed / 5.2) * 2.2) + a.spread;
-  if (!a.onGround) sp += 0.02;
-  if (a.ads) sp *= 0.45;
-  const ang = Math.random() * Math.PI * 2;
-  const r = sp * Math.sqrt(Math.random());
-  const d = aimDir(a);
-  // Offset the direction in the plane perpendicular to the aim.
-  const rx = -Math.sin(a.yaw), rz = Math.cos(a.yaw);
-  return {
-    x: d.x + rx * Math.cos(ang) * r,
-    y: d.y + Math.sin(ang) * r,
-    z: d.z + rz * Math.cos(ang) * r,
-  };
-}
-
-// Fire the shooter's current weapon once (auto weapons call this every
-// rof ms while the trigger is held). Returns true when a shot went out.
-export function shoot(shooter) {
-  if (!shooter.alive || S.phase !== 'live' || shooter.reloading > 0) return false;
-  const w = WEAPONS[shooter.weapon];
-  if (S.time - shooter.lastShot < w.rof / 1000) return false;
-  if (shooter.mag <= 0) { startReload(shooter); return false; }
-  shooter.lastShot = S.time;
-  shooter.mag--;
-  shooter.spread = Math.min(0.05, shooter.spread + w.bloom);
-  shooter.recoil = Math.min(0.06, shooter.recoil + w.recoil);
-  if (shooter.isPlayer) shooter.pitch = clamp(shooter.pitch + w.kick, -1.45, 1.45);
-  const pellets = w.pellets || 1;
-  let anyHit = false, anyKill = false;
-  for (let p = 0; p < pellets; p++) {
-    const dir = spreadDir(shooter, w.spread);
-    const { best, point, dist } = traceShot(shooter, dir);
-    hooks.tracer(eyePos(shooter), point, shooter.isPlayer);
+  // Fire one pellet. origin/direction as plain {x,y,z}. Returns a hit
+  // record or null. Tracer + impact particles + sound are spawned here.
+  firePellet(shooter, origin, dir, weapon, spread, rng, isPlayerShot) {
+    const S = this.S;
+    // Jitter the direction by the spread, inside a cone around the shot.
+    const a = rng() * Math.PI * 2;
+    const r = spread * Math.sqrt(rng());
+    // Orthonormal basis: right = dir x up, up2 = right x dir.
+    let rx = -dir.z, rz = dir.x;
+    const rl = Math.hypot(rx, rz);
+    if (rl < 1e-6) { rx = 1; rz = 0; } else { rx /= rl; rz /= rl; }
+    const bx = -rz * dir.y, by = rz * dir.x - rx * dir.z, bz = rx * dir.y;
+    const ca = Math.cos(a) * r, sa = Math.sin(a) * r;
+    const jx = dir.x + rx * ca + bx * sa;
+    const jy = dir.y + by * sa;
+    const jz = dir.z + rz * ca + bz * sa;
+    const len = Math.hypot(jx, jy, jz) || 1;
+    const ux = jx / len, uy = jy / len, uz = jz / len;
+    // Nearest wall along the ray.
+    let wallT = 120;
+    for (let i = 0; i < this.world.colliders.length; i++) {
+      const t = rayAABB(origin.x, origin.y, origin.z, ux, uy, uz, this.world.colliders[i]);
+      if (t < wallT) wallT = t;
+    }
+    // Nearest target.
+    let bestT = wallT, best = null, bestHead = false;
+    const targets = S.targets;
+    for (let i = 0; i < targets.length; i++) {
+      const tg = targets[i];
+      if (!tg.alive || tg.ref === shooter) continue;
+      if (tg.team === shooter.team) continue;
+      // Head sphere.
+      const ht = raySphere(origin.x, origin.y, origin.z, ux, uy, uz, tg.x, tg.y + 1.62, tg.z, 0.22);
+      if (ht < bestT) { bestT = ht; best = tg; bestHead = true; continue; }
+      // Body box.
+      const bt = rayAABB(origin.x, origin.y, origin.z, ux, uy, uz,
+        { x: tg.x, z: tg.z, w: tg.hw * 2, d: tg.hw * 2, h: 1.52 });
+      // Body box sits on the feet: rayAABB assumes base y=0, so shift.
+      if (bt < bestT && origin.y + bt * uy > tg.y + 0.3 && origin.y + bt * uy < tg.y + 1.52) {
+        bestT = bt; best = tg; bestHead = false;
+      }
+    }
+    // End point of the tracer.
+    _to.set(origin.x + ux * bestT, origin.y + uy * bestT, origin.z + uz * bestT);
+    if (bestT > 0.5) {
+      _from.set(origin.x, origin.y, origin.z);
+      this.render.spawnTracer(_from, _to, weapon.tracer);
+    }
     if (best) {
-      const fall = 1 - 0.35 * Math.min(1, dist / w.falloff);
-      const dmg = w.dmg * fall * (best.head ? w.head : 1);
-      const res = applyDamage(best.a, dmg, shooter, best.head, w.name);
-      anyHit = true;
-      if (res.killed) anyKill = true;
-      hooks.spark(point);
-    } else if (dist < 90) {
-      hooks.spark(point);
+      const dist = bestT;
+      let dmg = weapon.dmg;
+      if (dist > weapon.rangeFalloff) {
+        const f = clamp(1 - (dist - weapon.rangeFalloff) / weapon.rangeFalloff, 0, 1);
+        dmg = weapon.minDmg + (weapon.dmg - weapon.minDmg) * f;
+      }
+      if (bestHead) dmg *= weapon.headMult;
+      const killed = this.hooks.onDamage(best.ref, Math.round(dmg), bestHead, shooter);
+      return { hit: true, head: bestHead, kill: killed, target: best.ref, dist, point: { x: _to.x, y: _to.y, z: _to.z } };
     }
+    // Wall / ground impact.
+    if (wallT < 120) {
+      this.render.spawnParticles(_to.x, _to.y, _to.z, 6, 1.6, 1.6, 0xffc46b);
+    }
+    return { hit: false, dist: wallT };
   }
-  hooks.shotSound(shooter, w);
-  if (shooter.isPlayer && anyHit) hooks.hitmark(anyKill);
-  // Gunfire is loud: bots within 28 m turn toward the shooter.
-  for (const a of S.actors) {
-    if (a.alive && !a.isPlayer && a !== shooter) {
-      const d2 = (a.x - shooter.x) ** 2 + (a.z - shooter.z) ** 2;
-      if (d2 < 28 * 28) { a.hearX = shooter.x; a.hearZ = shooter.z; a.hearT = S.time; }
+
+  // Full weapon fire: pellets + sound + muzzle flash + recoil handled by caller.
+  fire(shooter, origin, dir, weapon, spread, rng, isPlayerShot) {
+    const S = this.S;
+    const results = [];
+    for (let p = 0; p < weapon.pellets; p++) {
+      const r = this.firePellet(shooter, origin, dir, weapon, spread, rng, isPlayerShot);
+      if (r) results.push(r);
     }
-  }
-  if (shooter.mag === 0) startReload(shooter);
-  return true;
-}
-
-// --- grenades ---
-const projectiles = [];
-
-export function throwGrenade(a, type) {
-  if (!a.alive || S.phase !== 'live' || (a.grenades[type] || 0) <= 0) return false;
-  a.grenades[type]--;
-  const d = aimDir(a);
-  const o = eyePos(a);
-  projectiles.push({
-    x: o.x + d.x * 0.6, y: o.y + d.y * 0.6 - 0.1, z: o.z + d.z * 0.6,
-    vx: d.x * 15, vy: d.y * 15 + 2.5, vz: d.z * 15,
-    type, owner: a, ttl: 2.4, bounces: 0,
-  });
-  return true;
-}
-
-function explodeFrag(p) {
-  hooks.explode(p);
-  for (const a of S.actors) {
-    if (!a.alive || a === p.owner) continue;
-    const dx = a.x - p.x, dz = a.z - p.z, dy = (a.y + 1) - p.y;
-    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (dist > 7.5) continue;
-    if (segmentBlocked(p.x, p.y, p.z, a.x, a.y + 1, a.z, MAP.solids, null)) continue;
-    const dmg = Math.max(15, 130 * (1 - dist / 7.5));
-    applyDamage(a, dmg, p.owner, false, 'Frag');
-  }
-}
-
-export function stepProjectiles(dt) {
-  for (let i = projectiles.length - 1; i >= 0; i--) {
-    const p = projectiles[i];
-    p.ttl -= dt;
-    p.vy -= 14 * dt;
-    // Axis-separated bounce against solids and the ground.
-    let nx = p.x + p.vx * dt;
-    let inside = false;
-    for (const s of MAP.solids) {
-      if (nx > s.x0 - 0.12 && nx < s.x1 + 0.12 && p.y > 0 && p.y < s.h
-        && p.z > s.z0 - 0.12 && p.z < s.z1 + 0.12) { inside = true; break; }
-    }
-    if (inside || nx < MAP.bounds.x0 || nx > MAP.bounds.x1) { p.vx *= -0.4; p.bounces++; }
-    else p.x = nx;
-    let nz = p.z + p.vz * dt;
-    inside = false;
-    for (const s of MAP.solids) {
-      if (p.x > s.x0 - 0.12 && p.x < s.x1 + 0.12 && p.y > 0 && p.y < s.h
-        && nz > s.z0 - 0.12 && nz < s.z1 + 0.12) { inside = true; break; }
-    }
-    if (inside || nz < MAP.bounds.z0 || nz > MAP.bounds.z1) { p.vz *= -0.4; p.bounces++; }
-    else p.z = nz;
-    p.y += p.vy * dt;
-    if (p.y < 0.12) { p.y = 0.12; p.vy = Math.abs(p.vy) > 1.2 ? -p.vy * 0.4 : 0; p.bounces++; }
-    for (const s of MAP.solids) {
-      if (p.y > s.h - 0.12 && p.y < s.h + 0.12 && p.x > s.x0 && p.x < s.x1 && p.z > s.z0 && p.z < s.z1) {
-        p.y = s.h + 0.12; p.vy = Math.abs(p.vy) > 1.2 ? -p.vy * 0.4 : 0; p.bounces++;
+    const dist = results.length && results[0].hit ? results[0].dist : 40;
+    this.sfx.shot(weapon.sound, isPlayerShot ? 0 : dist);
+    S.stats.shots += weapon.pellets;
+    let hitAny = false, killAny = false, headAny = false;
+    for (const r of results) {
+      if (r.hit) {
+        hitAny = true; S.stats.hits += 1;
+        if (r.head) { headAny = true; S.stats.headshots += 1; }
+        if (r.kill) killAny = true;
       }
     }
-    if (p.ttl <= 0 || p.bounces >= 3) {
-      projectiles.splice(i, 1);
-      if (p.type === 'frag') explodeFrag(p);
-      else if (p.type === 'smoke') S.smokes.push({ x: p.x, y: 1.4, z: p.z, r: 4.5, ttl: 15 });
-      else if (p.type === 'flash') {
-        // Blinded bots pause; the player's screen flash is a hook.
-        for (const a of S.actors) {
-          if (!a.alive) continue;
-          const dx = a.x - p.x, dz = a.z - p.z;
-          const dist = Math.sqrt(dx * dx + dz * dz);
-          if (dist > 26) continue;
-          if (segmentBlocked(p.x, p.y, p.z, a.x, a.y + 1.4, a.z, MAP.solids, null)) continue;
-          if (a.isPlayer) {
-            const d = aimDir(a);
-            const dot = (d.x * dx + d.z * dz) / Math.max(0.01, dist);
-            if (dot > 0.2) hooks.flash((1 - dist / 26) * dot);
-          } else {
-            a.blindT = 1 + 2 * (1 - dist / 26);
-          }
-        }
+    return { hit: hitAny, kill: killAny, head: headAny };
+  }
+
+  throwGrenadeEntity(owner, pos, dir, kind) {
+    this.S.grenades.push({
+      x: pos.x, y: pos.y + 0.1, z: pos.z,
+      vx: dir.x * 13, vy: dir.y * 13 + 4.2, vz: dir.z * 13,
+      fuse: kind === 'frag' ? 2.6 : 1.4, kind, owner, bounced: 0,
+    });
+    this.sfx.throwWhoosh();
+  }
+
+  stepGrenades(dt) {
+    const S = this.S;
+    for (let i = S.grenades.length - 1; i >= 0; i--) {
+      const g = S.grenades[i];
+      g.vy -= 12 * dt;
+      g.x += g.vx * dt; g.y += g.vy * dt; g.z += g.vz * dt;
+      if (g.y < 0.12) { g.y = 0.12; g.vy *= -0.35; g.vx *= 0.6; g.vz *= 0.6; g.bounced++; }
+      const p = { x: g.x, y: g.y, z: g.z };
+      if (this.world.collideCircle(p, 0.15)) { g.x = p.x; g.z = p.z; g.vx *= -0.3; g.vz *= -0.3; }
+      g.fuse -= dt;
+      if (g.fuse <= 0) {
+        S.grenades.splice(i, 1);
+        if (g.kind === 'frag') this._detonate(g);
+        else this._popSmoke(g);
       }
     }
+    // Smoke decay.
+    for (let i = S.smokes.length - 1; i >= 0; i--) {
+      S.smokes[i].t -= dt;
+      if (S.smokes[i].t <= 0) S.smokes.splice(i, 1);
+    }
   }
-}
 
-// A bot fires at a known target with skill-based aim error. Returns true
-// when a shot went out.
-export function botShoot(bot, target) {
-  if (S.time - bot.lastShot < WEAPONS[bot.weapon].rof / 1000) return false;
-  const dx = target.x - bot.x, dz = target.z - bot.z;
-  const dist = Math.hypot(dx, dz);
-  const baseYaw = Math.atan2(dz, dx);
-  const basePitch = Math.atan2((target.y + 1.1) - (bot.y + 1.5), dist);
-  // Error grows with distance and target speed, shrinks with skill.
-  const err = (0.02 + dist * 0.0016 + Math.hypot(target.vx, target.vz) * 0.012) / bot.skill;
-  bot.yaw = baseYaw + (Math.random() - 0.5) * err * 2;
-  bot.pitch = basePitch + (Math.random() - 0.5) * err * 2;
-  return shoot(bot);
+  _detonate(g) {
+    const S = this.S;
+    this.sfx.explosion();
+    this.render.spawnParticles(g.x, g.y + 0.4, g.z, 42, 5, 4, 0xff7a2e);
+    this.render.spawnParticles(g.x, g.y + 0.4, g.z, 20, 2.5, 6, 0xffd27a);
+    if (S.player && S.player.alive) {
+      const d = Math.hypot(S.player.pos.x - g.x, S.player.pos.z - g.z);
+      if (d < 7) {
+        const dmg = Math.round(18 + (120 - 18) * (1 - d / 7));
+        this.hooks.onDamage(S.player, dmg, false, g.owner);
+      }
+    }
+    for (const b of S.bots) {
+      if (!b.alive) continue;
+      const d = Math.hypot(b.pos.x - g.x, b.pos.z - g.z);
+      if (d < 7) {
+        const dmg = Math.round(18 + (120 - 18) * (1 - d / 7));
+        this.hooks.onDamage(b, dmg, false, g.owner);
+      }
+    }
+    if (S.player) S.shake = Math.max(S.shake, 0.5);
+  }
+
+  _popSmoke(g) {
+    this.S.smokes.push({ x: g.x, y: 1.2, z: g.z, r: 5.5, t: 13 });
+    this.render.spawnParticles(g.x, g.y + 0.6, g.z, 26, 2, 2.5, 0x9aa4ad);
+  }
 }

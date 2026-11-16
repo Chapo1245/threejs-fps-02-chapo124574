@@ -1,388 +1,262 @@
-// world.js — builds the visible Brickline district from mapdata and keeps
-// the per-frame visuals (bodies, tracers, smoke, bomb, rifle) in sync with
-// the simulation state. The simulation owns all game data; this module only
-// draws it. All art is procedural: canvas textures and styled geometry.
+// world.js — builds the three.js scene for one layout and owns all
+// spatial queries: AABB collision, line of sight, waypoint routes.
+// Static geometry goes into two InstancedMeshes (walls, crates) so the
+// whole map costs a handful of draw calls. No per-frame allocation:
+// every query reuses module-level scratch values.
 
 import * as THREE from 'three';
-import { MAP } from './mapdata.js';
-import { mulberry32 } from './util.js';
+import { COLOR_KEYS } from './layouts.js';
 
-const BRICK_TONES = [
-  { base: '#a85a38', mortar: '#7c4230', dark: '#8a4527' },
-  { base: '#96402e', mortar: '#6e2f22', dark: '#7a3222' },
-  { base: '#b57a44', mortar: '#8a5c31', dark: '#96683a' },
-  { base: '#8a4a34', mortar: '#653626', dark: '#743c2a' },
-];
-const CONTAINER_COLORS = ['#2e5f8a', '#a85a28', '#2e7a6a', '#7a7a3a'];
-
-function canvasTex(w, h, draw, rx, ry) {
-  const c = document.createElement('canvas');
-  c.width = w; c.height = h;
-  draw(c.getContext('2d'), w, h);
-  const t = new THREE.CanvasTexture(c);
-  t.wrapS = t.wrapT = THREE.RepeatWrapping;
-  t.repeat.set(rx || 1, ry || 1);
-  t.colorSpace = THREE.SRGBColorSpace;
-  t.anisotropy = 4;
-  return t;
+// 2D segment vs AABB slab test. Returns true when the segment crosses
+// the box (in XZ) and the box is tall enough to block the sight line.
+function segmentHitsBox(x0, z0, x1, z1, b, eyeLo) {
+  if (b.h < eyeLo) return false; // low cover never blocks sight
+  const dx = x1 - x0, dz = z1 - z0;
+  let t0 = 0, t1 = 1;
+  const bx0 = b.x - b.w / 2, bx1 = b.x + b.w / 2;
+  const bz0 = b.z - b.d / 2, bz1 = b.z + b.d / 2;
+  if (Math.abs(dx) < 1e-9) { if (x0 < bx0 || x0 > bx1) return false; }
+  else {
+    let ta = (bx0 - x0) / dx, tb = (bx1 - x0) / dx;
+    if (ta > tb) { const t = ta; ta = tb; tb = t; }
+    if (ta > t0) t0 = ta;
+    if (tb < t1) t1 = tb;
+    if (t0 > t1) return false;
+  }
+  if (Math.abs(dz) < 1e-9) { if (z0 < bz0 || z0 > bz1) return false; }
+  else {
+    let ta = (bz0 - z0) / dz, tb = (bz1 - z0) / dz;
+    if (ta > tb) { const t = ta; ta = tb; tb = t; }
+    if (ta > t0) t0 = ta;
+    if (tb < t1) t1 = tb;
+    if (t0 > t1) return false;
+  }
+  return true;
 }
 
-function brickTexture(tone) {
-  const t = BRICK_TONES[tone];
-  const rnd = mulberry32(100 + tone * 17);
-  return canvasTex(256, 256, (g, w, h) => {
-    g.fillStyle = t.mortar; g.fillRect(0, 0, w, h);
-    const bh = 16, bw = 42;
-    for (let y = 0; y < h; y += bh) {
-      const off = (y / bh) % 2 ? bw / 2 : 0;
-      for (let x = -bw; x < w + bw; x += bw) {
-        const v = 0.86 + rnd() * 0.28;
-        g.fillStyle = shade(t.base, v);
-        g.fillRect(x + off + 1, y + 1, bw - 2, bh - 2);
-        if (rnd() < 0.12) { g.fillStyle = t.dark; g.fillRect(x + off + 1, y + 1, bw - 2, bh - 2); }
+export class World {
+  // shadowsOn is decided once at boot (off on touch): toggling a light's
+  // castShadow at runtime recompiles every material — a visible hitch
+  // mid-fight. Adaptive quality only ever changes pixel ratio + particles.
+  constructor(scene, layout, palette, sun, hemi, shadowsOn) {
+    this.layout = layout;
+    this.bounds = layout.bounds;
+    this.colliders = [];
+    for (const w of layout.walls) this.colliders.push(w);
+    for (const c of layout.crates) this.colliders.push(c);
+    this.scene = scene;
+    this.group = new THREE.Group();
+    scene.add(this.group);
+
+    // Ground: one big plane with a subtle grid texture painted by canvas.
+    const groundTex = this._groundTexture(palette.ground);
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(layout.bounds.x * 2 + 4, layout.bounds.z * 2 + 4),
+      new THREE.MeshStandardMaterial({ map: groundTex, roughness: 0.94, metalness: 0.05 }),
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    this.group.add(ground);
+
+    // Static boxes as instanced meshes — one per material family.
+    this._instanced(layout.walls, 0.85, 0.12, true);
+    this._instanced(layout.crates, 0.9, 0.08, false);
+
+    // Site markers: flat rings + floating letter boards.
+    this.siteMeshes = {};
+    for (const key of ['A', 'B']) {
+      const s = layout.sites[key];
+      const ring = new THREE.Mesh(
+        new THREE.RingGeometry(s.r - 0.35, s.r, 40),
+        new THREE.MeshBasicMaterial({ color: key === 'A' ? 0xff8c2e : 0x4fc3ff, transparent: true, opacity: 0.75, side: THREE.DoubleSide }),
+      );
+      ring.rotation.x = -Math.PI / 2;
+      ring.position.set(s.x, 0.06, s.z);
+      this.group.add(ring);
+      const board = this._letterBoard(key, key === 'A' ? '#ff8c2e' : '#4fc3ff');
+      board.position.set(s.x, 3.4, s.z);
+      this.group.add(board);
+      this.siteMeshes[key] = ring;
+    }
+
+    // Bomb prop (hidden until planted).
+    const bombGeo = new THREE.BoxGeometry(0.55, 0.35, 0.4);
+    this.bombMesh = new THREE.Mesh(bombGeo, new THREE.MeshStandardMaterial({ color: 0x1c1c22, roughness: 0.4, metalness: 0.7, emissive: 0xcc2200, emissiveIntensity: 0.4 }));
+    this.bombMesh.visible = false;
+    this.bombMesh.castShadow = true;
+    this.group.add(this.bombMesh);
+
+    // Lights: hemisphere + one shadow-casting sun + warm lamps.
+    const hemiLight = new THREE.HemisphereLight(hemi.sky, hemi.ground, hemi.intensity);
+    scene.add(hemiLight);
+    this.sun = new THREE.DirectionalLight(sun.color, sun.intensity);
+    this.sun.position.set(sun.pos[0], sun.pos[1], sun.pos[2]);
+    this.sun.target.position.set(0, 0, 0);
+    const R = Math.max(layout.bounds.x, layout.bounds.z);
+    this.sun.shadow.camera.left = -R - 6; this.sun.shadow.camera.right = R + 6;
+    this.sun.shadow.camera.top = R + 6; this.sun.shadow.camera.bottom = -R - 6;
+    this.sun.shadow.camera.far = 120;
+    this.sun.shadow.mapSize.set(1024, 1024);
+    this.sun.shadow.bias = -0.0006;
+    this.sun.castShadow = shadowsOn;
+    scene.add(this.sun); scene.add(this.sun.target);
+    this.lamps = [];
+    for (const l of layout.lamps) {
+      const pl = new THREE.PointLight(l.color, l.i, 26, 1.6);
+      pl.position.set(l.x, l.y, l.z);
+      scene.add(pl);
+      this.lamps.push(pl);
+    }
+    // Fog + background from the palette.
+    scene.background = new THREE.Color(palette.sky);
+    scene.fog = new THREE.Fog(palette.fog, 45, 130);
+  }
+
+  _groundTexture(base) {
+    const cv = document.createElement('canvas');
+    cv.width = 256; cv.height = 256;
+    const g = cv.getContext('2d');
+    g.fillStyle = '#' + base.toString(16).padStart(6, '0');
+    g.fillRect(0, 0, 256, 256);
+    // speckle + panel seams, deterministic pattern (fixed loop, no RNG)
+    g.strokeStyle = 'rgba(255,255,255,0.05)';
+    g.lineWidth = 2;
+    for (let i = 0; i <= 4; i++) {
+      g.beginPath(); g.moveTo(i * 64, 0); g.lineTo(i * 64, 256); g.stroke();
+      g.beginPath(); g.moveTo(0, i * 64); g.lineTo(256, i * 64); g.stroke();
+    }
+    for (let i = 0; i < 220; i++) {
+      const x = (i * 37) % 256, y = (i * 91) % 256;
+      g.fillStyle = i % 3 ? 'rgba(0,0,0,0.10)' : 'rgba(255,255,255,0.05)';
+      g.fillRect(x, y, 3, 3);
+    }
+    const tex = new THREE.CanvasTexture(cv);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(8, 6);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  _instanced(boxes, roughness, metalness, castShadow) {
+    if (!boxes.length) return;
+    const geo = new THREE.BoxGeometry(1, 1, 1);
+    const mat = new THREE.MeshStandardMaterial({ roughness, metalness });
+    const mesh = new THREE.InstancedMesh(geo, mat, boxes.length);
+    const m = new THREE.Matrix4();
+    const col = new THREE.Color();
+    boxes.forEach((b, i) => {
+      m.makeScale(b.w, b.h, b.d);
+      m.setPosition(b.x, b.h / 2, b.z);
+      mesh.setMatrixAt(i, m);
+      col.setHex(COLOR_KEYS[b.c] || 0x888888);
+      mesh.setColorAt(i, col);
+    });
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    mesh.castShadow = castShadow;
+    mesh.receiveShadow = true;
+    this.group.add(mesh);
+  }
+
+  _letterBoard(letter, colorCss) {
+    const cv = document.createElement('canvas');
+    cv.width = 128; cv.height = 128;
+    const g = cv.getContext('2d');
+    g.fillStyle = 'rgba(10,12,14,0.82)';
+    g.fillRect(0, 0, 128, 128);
+    g.strokeStyle = colorCss; g.lineWidth = 6;
+    g.strokeRect(5, 5, 118, 118);
+    g.fillStyle = colorCss;
+    g.font = 'bold 84px system-ui, sans-serif';
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillText(letter, 64, 68);
+    const tex = new THREE.CanvasTexture(cv);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    const mesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(1.7, 1.7),
+      new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide }),
+    );
+    return mesh;
+  }
+
+  // Circle (XZ) vs AABBs. Moves the circle out along the smallest
+  // penetration axis; returns true if any push happened.
+  collideCircle(p, r) {
+    let hit = false;
+    for (let i = 0; i < this.colliders.length; i++) {
+      const b = this.colliders[i];
+      if (p.y > b.h) continue; // feet above the box top top
+      const bx0 = b.x - b.w / 2 - r, bx1 = b.x + b.w / 2 + r;
+      const bz0 = b.z - b.d / 2 - r, bz1 = b.z + b.d / 2 + r;
+      if (p.x < bx0 || p.x > bx1 || p.z < bz0 || p.z > bz1) continue;
+      // inside expanded box: push out on the shallowest axis
+      const dxl = p.x - bx0, dxr = bx1 - p.x;
+      const dzl = p.z - bz0, dzr = bz1 - p.z;
+      const m = Math.min(dxl, dxr, dzl, dzr);
+      if (m === dxl) p.x = bx0;
+      else if (m === dxr) p.x = bx1;
+      else if (m === dzl) p.z = bz0;
+      else p.z = bz1;
+      hit = true;
+    }
+    // Outer bounds clamp.
+    const bx = this.bounds.x - 0.4, bz = this.bounds.z - 0.4;
+    if (p.x < -bx) { p.x = -bx; hit = true; }
+    if (p.x > bx) { p.x = bx; hit = true; }
+    if (p.z < -bz) { p.z = -bz; hit = true; }
+    if (p.z > bz) { p.z = bz; hit = true; }
+    return hit;
+  }
+
+  // Line of sight between two eye positions, blocked by tall boxes and
+  // by active smoke spheres (smokes: [{x,y,z,r}]).
+  hasLOS(ax, ay, az, bx, by, bz, smokes) {
+    const eyeLo = Math.min(ay, by) - 0.15;
+    for (let i = 0; i < this.colliders.length; i++) {
+      if (segmentHitsBox(ax, az, bx, bz, this.colliders[i], eyeLo)) return false;
+    }
+    if (smokes) {
+      for (let i = 0; i < smokes.length; i++) {
+        const s = smokes[i];
+        if (this._segSphere(ax, ay, az, bx, by, bz, s.x, s.y, s.z, s.r)) return false;
       }
     }
-  }, 1, 1);
-}
+    return true;
+  }
 
-function shade(hex, f) {
-  const n = parseInt(hex.slice(1), 16);
-  const r = Math.min(255, ((n >> 16) & 255) * f) | 0;
-  const g = Math.min(255, ((n >> 8) & 255) * f) | 0;
-  const b = Math.min(255, (n & 255) * f) | 0;
-  return `rgb(${r},${g},${b})`;
-}
+  _segSphere(ax, ay, az, bx, by, bz, cx, cy, cz, r) {
+    const dx = bx - ax, dy = by - ay, dz = bz - az;
+    const len2 = dx * dx + dy * dy + dz * dz;
+    let t = len2 === 0 ? 0 : ((cx - ax) * dx + (cy - ay) * dy + (cz - az) * dz) / len2;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const px = ax + dx * t - cx, py = ay + dy * t - cy, pz = az + dz * t - cz;
+    return px * px + py * py + pz * pz < r * r;
+  }
 
-function asphaltTexture() {
-  const rnd = mulberry32(42);
-  return canvasTex(512, 512, (g, w, h) => {
-    g.fillStyle = '#3b3b3e'; g.fillRect(0, 0, w, h);
-    for (let i = 0; i < 5200; i++) {
-      const v = rnd();
-      g.fillStyle = v < 0.5 ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.10)';
-      g.fillRect(rnd() * w, rnd() * h, 1 + rnd() * 2, 1 + rnd() * 2);
+  // Nearest waypoint node id to a position.
+  nearestNode(x, z) {
+    const nodes = this.layout.nodes;
+    let best = 0, bd = Infinity;
+    for (let i = 0; i < nodes.length; i++) {
+      const dx = nodes[i][0] - x, dz = nodes[i][1] - z;
+      const d = dx * dx + dz * dz;
+      if (d < bd) { bd = d; best = i; }
     }
-    for (let i = 0; i < 9; i++) {
-      g.fillStyle = 'rgba(0,0,0,0.08)';
-      g.fillRect(rnd() * w, 0, 20 + rnd() * 50, h);
-    }
-  }, 10, 8);
-}
-
-function containerTexture(tone) {
-  const rnd = mulberry32(300 + tone * 13);
-  return canvasTex(256, 128, (g, w, h) => {
-    g.fillStyle = CONTAINER_COLORS[tone]; g.fillRect(0, 0, w, h);
-    for (let x = 0; x < w; x += 16) {
-      g.fillStyle = 'rgba(0,0,0,0.22)'; g.fillRect(x, 0, 5, h);
-      g.fillStyle = 'rgba(255,255,255,0.08)'; g.fillRect(x + 5, 0, 2, h);
-    }
-    g.fillStyle = 'rgba(0,0,0,0.35)'; g.fillRect(0, 0, w, 6); g.fillRect(0, h - 6, w, 6);
-    if (rnd() < 1) { g.fillStyle = 'rgba(255,255,255,0.25)'; g.font = 'bold 20px Arial'; g.fillText('BRICKLINE', 14, 34); }
-  }, 1, 1);
-}
-
-function crosswalkTexture() {
-  return canvasTex(256, 128, (g, w, h) => {
-    g.clearRect(0, 0, w, h);
-    g.fillStyle = 'rgba(240,240,235,0.85)';
-    for (let x = 8; x < w; x += 36) g.fillRect(x, 6, 18, h - 12);
-  }, 1, 1);
-}
-
-// One blocky humanoid. Head and torso refs are kept for hit tests and for
-// the minimap arrow. Team colours: azure blue / rust amber, spiky hair
-// like the reference bots, backpack and a held gun box.
-export function makeBody(team) {
-  const g = new THREE.Group();
-  const main = team === 'azure' ? 0x2f7fe0 : 0xe8862e;
-  const dark = team === 'azure' ? 0x1d4e8a : 0x8a4a12;
-  const skin = 0xc9a184;
-  const hair = team === 'azure' ? 0x2a2118 : 0xd8b25e;
-  const mat = (c) => new THREE.MeshLambertMaterial({ color: c });
-  const box = (w, h, d, c, x, y, z) => {
-    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat(c));
-    m.position.set(x, y, z); g.add(m); return m;
-  };
-  const legL = box(0.22, 0.72, 0.24, 0x2e2a26, -0.14, 0.36, 0);
-  const legR = box(0.22, 0.72, 0.24, 0x2e2a26, 0.14, 0.36, 0);
-  const torso = box(0.62, 0.68, 0.36, main, 0, 1.08, 0);
-  box(0.66, 0.3, 0.4, dark, 0, 1.14, 0); // vest
-  box(0.3, 0.44, 0.14, 0x3a2f26, 0, 1.1, -0.26); // backpack
-  const head = box(0.34, 0.34, 0.34, skin, 0, 1.62, 0);
-  box(0.36, 0.1, 0.36, hair, 0, 1.82, 0); // hair cap
-  box(0.1, 0.22, 0.1, hair, -0.1, 1.92, 0); // spikes
-  box(0.1, 0.28, 0.1, hair, 0.08, 1.95, -0.04);
-  box(0.08, 0.2, 0.08, hair, 0.16, 1.9, 0.06);
-  const armL = box(0.16, 0.55, 0.18, main, -0.4, 1.12, 0.12);
-  const armR = box(0.16, 0.55, 0.18, main, 0.4, 1.12, 0.12);
-  const gun = box(0.09, 0.14, 0.85, 0x1c1e22, 0.12, 1.18, 0.45);
-  armL.rotation.x = -0.9; armR.rotation.x = -0.9;
-  gun.rotation.x = 0.12;
-  g.userData = { head, torso, legL, legR, armL, armR, gun, walkPhase: 0 };
-  return g;
-}
-
-// First-person rifle view model, attached to the camera.
-export function makeRifle() {
-  const g = new THREE.Group();
-  const mat = (c) => new THREE.MeshLambertMaterial({ color: c });
-  const dark = mat(0x4a4e57), mid = mat(0x6b707a), accent = mat(0x8a6a3a);
-  const box = (w, h, d, m, x, y, z) => {
-    const q = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m);
-    q.position.set(x, y, z); g.add(q); return q;
-  };
-  box(0.09, 0.13, 0.62, dark, 0, 0, -0.1);          // receiver
-  box(0.05, 0.05, 0.5, mid, 0, 0.02, -0.55);        // barrel
-  box(0.07, 0.09, 0.1, accent, 0, 0.1, -0.12);      // scope
-  box(0.06, 0.2, 0.1, dark, 0, -0.14, 0.02);        // magazine
-  box(0.08, 0.1, 0.3, dark, 0, -0.02, 0.28);        // stock
-  const flash = new THREE.Mesh(new THREE.PlaneGeometry(0.34, 0.34),
-    new THREE.MeshBasicMaterial({ color: 0xffd27a, transparent: true, opacity: 0.9, side: THREE.DoubleSide }));
-  flash.position.set(0, 0.02, -0.82); flash.visible = false;
-  g.add(flash);
-  g.position.set(0.26, -0.23, -0.45);
-  g.userData.flash = flash;
-  return g;
-}
-
-export function createWorld(scene) {
-  scene.background = new THREE.Color(0xf0c184);
-  scene.fog = new THREE.Fog(0xeab27c, 55, 155);
-  scene.add(new THREE.HemisphereLight(0xcfd8ff, 0x8a6a52, 0.85));
-  const sun = new THREE.DirectionalLight(0xffd9a0, 1.35);
-  sun.position.set(-40, 30, -18);
-  scene.add(sun);
-
-  // --- ground: asphalt + painted road markings ---
-  const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(88, 64),
-    new THREE.MeshLambertMaterial({ map: asphaltTexture() }));
-  ground.rotation.x = -Math.PI / 2;
-  scene.add(ground);
-  const yellow = new THREE.MeshLambertMaterial({ color: 0xc9a227 });
-  const white = new THREE.MeshLambertMaterial({ color: 0xd8d8d2 });
-  const mark = (w, d, x, z, m) => {
-    const q = new THREE.Mesh(new THREE.BoxGeometry(w, 0.02, d), m);
-    q.position.set(x, 0.011, z); scene.add(q);
-  };
-  for (const z of [-21, 0, 21]) {
-    mark(80, 0.14, 0, z - 0.32, yellow); mark(80, 0.14, 0, z + 0.32, yellow);
-  }
-  const cwTex = crosswalkTexture();
-  for (const [x, z] of [[-13, -21], [13, -21], [-13, 21], [13, 21], [-13, 0], [13, 0]]) {
-    const cw = new THREE.Mesh(new THREE.PlaneGeometry(9, 3.4),
-      new THREE.MeshLambertMaterial({ map: cwTex, transparent: true }));
-    cw.rotation.x = -Math.PI / 2; cw.rotation.z = Math.PI / 2;
-    cw.position.set(x, 0.012, z); scene.add(cw);
+    return best;
   }
 
-  // --- buildings: brick boxes with cloned brick textures + roof caps ---
-  const roofMat = new THREE.MeshLambertMaterial({ color: 0x4a3a30 });
-  const darkMat = new THREE.MeshLambertMaterial({ color: 0x241a14 });
-  const brickTexes = [0, 1, 2, 3].map(brickTexture);
-  const winDark = [];
-  const winLit = [];
-  const tmpM = new THREE.Matrix4();
-  const tmpQ = new THREE.Quaternion();
-  const tmpE = new THREE.Euler();
-  const tmpV = new THREE.Vector3();
-  const tmpS = new THREE.Vector3(1, 1, 1);
-  const rndWin = mulberry32(99);
-  for (const s of MAP.solids) {
-    if (s.kind !== 'brick') continue;
-    const w = s.x1 - s.x0, d = s.z1 - s.z0;
-    const tex = brickTexes[s.tone].clone();
-    tex.needsUpdate = true;
-    tex.repeat.set(Math.max(1, Math.round(w / 9)), Math.max(1, Math.round(s.h / 9)));
-    const side = new THREE.MeshLambertMaterial({ map: tex });
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, s.h, d),
-      [side, side, roofMat, darkMat, side, side]);
-    mesh.position.set((s.x0 + s.x1) / 2, s.h / 2, (s.z0 + s.z1) / 2);
-    scene.add(mesh);
-    // Windows: grids on all four faces, lit ones sprinkled in.
-    const faces = [
-      { n: 0, len: d, at: (t) => [s.x0 - 0.02, t, s.z0], ry: -Math.PI / 2, axis: 'z' },
-      { n: 1, len: d, at: (t) => [s.x1 + 0.02, t, s.z0], ry: Math.PI / 2, axis: 'z' },
-      { n: 2, len: w, at: (t) => [s.x0, t, s.z0 - 0.02], ry: Math.PI, axis: 'x' },
-      { n: 3, len: w, at: (t) => [s.x0, t, s.z1 + 0.02], ry: 0, axis: 'x' },
-    ];
-    for (const f of faces) {
-      for (let y = 2.4; y + 1.8 < s.h - 0.4; y += 3) {
-        for (let t = 1.8; t + 1.4 < f.len - 0.6; t += 3) {
-          const [px, , pz] = f.at(t);
-          const x = f.axis === 'z' ? px : px + t;
-          const z = f.axis === 'z' ? pz + t : pz;
-          tmpE.set(0, f.ry, 0); tmpQ.setFromEuler(tmpE);
-          tmpV.set(x, y + 0.9, z);
-          tmpM.compose(tmpV, tmpQ, tmpS);
-          (rndWin() < 0.16 ? winLit : winDark).push(tmpM.clone());
-        }
-      }
-    }
-  }
-  const winGeo = new THREE.PlaneGeometry(1.4, 1.8);
-  const mkInst = (list, mat) => {
-    const im = new THREE.InstancedMesh(winGeo, mat, Math.max(1, list.length));
-    list.forEach((m, i) => im.setMatrixAt(i, m));
-    im.instanceMatrix.needsUpdate = true;
-    scene.add(im);
-    return im;
-  };
-  mkInst(winDark, new THREE.MeshLambertMaterial({ color: 0x1a2430 }));
-  mkInst(winLit, new THREE.MeshBasicMaterial({ color: 0xffc06a }));
-
-  // --- containers, crates, barrels, van, crane ---
-  const contTexes = [0, 1, 2, 3].map(containerTexture);
-  for (const s of MAP.solids) {
-    if (s.kind === 'brick') continue;
-    const w = s.x1 - s.x0, d = s.z1 - s.z0;
-    let mat;
-    if (s.kind === 'container') {
-      const tex = contTexes[s.tone].clone(); tex.needsUpdate = true;
-      mat = new THREE.MeshLambertMaterial({ map: tex });
-    } else if (s.kind === 'crate') {
-      mat = new THREE.MeshLambertMaterial({ color: s.tone % 2 ? 0x8a6a3a : 0x6a5a3a });
-    } else if (s.kind === 'barrel') {
-      mat = new THREE.MeshLambertMaterial({ color: ['#7a3a2a', '#3a5a7a', '#5a7a3a', '#8a7a2a'][s.tone] });
-    } else if (s.kind === 'van') {
-      mat = new THREE.MeshLambertMaterial({ color: 0x5a6a72 });
-    } else { // crane leg
-      mat = new THREE.MeshLambertMaterial({ color: 0xb0702a });
-    }
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, s.h, d), mat);
-    mesh.position.set((s.x0 + s.x1) / 2, s.h / 2, (s.z0 + s.z1) / 2);
-    scene.add(mesh);
-    if (s.kind === 'van') {
-      const cab = new THREE.Mesh(new THREE.BoxGeometry(1.4, 1.1, 1.9),
-        new THREE.MeshLambertMaterial({ color: 0x3a4a52 }));
-      cab.position.set(s.x1 - 0.4, s.h + 0.4, (s.z0 + s.z1) / 2);
-      scene.add(cab);
-    }
-  }
-  // Crane jib across site A + counterweight box.
-  const jib = MAP.craneJib;
-  const jibMesh = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.7, jib.z1 - jib.z0 + 4),
-    new THREE.MeshLambertMaterial({ color: 0xb0702a }));
-  jibMesh.position.set(jib.x0, jib.y, (jib.z0 + jib.z1) / 2);
-  scene.add(jibMesh);
-  const hook = new THREE.Mesh(new THREE.BoxGeometry(0.9, 1.6, 0.9),
-    new THREE.MeshLambertMaterial({ color: 0x2a2a2e }));
-  hook.position.set(jib.x0, jib.y - 3.4, jib.z0 + 3);
-  scene.add(hook);
-
-  // --- lamps (pole + warm head) and planters ---
-  const poleMat = new THREE.MeshLambertMaterial({ color: 0x2a2a2e });
-  const lampHeadMat = new THREE.MeshBasicMaterial({ color: 0xffd9a0 });
-  for (const [x, z] of MAP.lamps) {
-    const pole = new THREE.Mesh(new THREE.BoxGeometry(0.14, 5.4, 0.14), poleMat);
-    pole.position.set(x, 2.7, z); scene.add(pole);
-    const head = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.18, 0.3), lampHeadMat);
-    head.position.set(x, 5.5, z); scene.add(head);
-  }
-  const planterMat = new THREE.MeshLambertMaterial({ color: 0x6a5a48 });
-  const bushMat = new THREE.MeshLambertMaterial({ color: 0x4a6a3a });
-  for (const [x, z] of MAP.planters) {
-    const p = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.55, 1.1), planterMat);
-    p.position.set(x, 0.28, z); scene.add(p);
-    const b = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.5, 0.9), bushMat);
-    b.position.set(x, 0.75, z); scene.add(b);
+  nodePos(id, out) {
+    const n = this.layout.nodes[id];
+    out.x = n[0]; out.z = n[1];
+    return out;
   }
 
-  // --- bomb mesh (hidden until planted) ---
-  const bomb = new THREE.Group();
-  const bombBody = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.3, 0.4),
-    new THREE.MeshLambertMaterial({ color: 0x1c1e22 }));
-  bomb.add(bombBody);
-  const bombLight = new THREE.Mesh(new THREE.SphereGeometry(0.07, 8, 8),
-    new THREE.MeshBasicMaterial({ color: 0xff2a1a }));
-  bombLight.position.set(0, 0.22, 0);
-  bomb.add(bombLight);
-  bomb.visible = false;
-  scene.add(bomb);
+  setBombVisible(x, z, visible) {
+    this.bombMesh.visible = visible;
+    if (visible) this.bombMesh.position.set(x, 0.18, z);
+  }
 
-  // --- pooled tracers + impact sparks (no per-frame allocation) ---
-  const tracers = [];
-  for (let i = 0; i < 10; i++) {
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
-    const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
-      color: 0xffe9a8, transparent: true, opacity: 0 }));
-    line.frustumCulled = false;
-    scene.add(line);
-    tracers.push({ line, ttl: 0 });
+  dispose() {
+    this.scene.remove(this.group);
   }
-  const sparks = [];
-  for (let i = 0; i < 8; i++) {
-    const m = new THREE.Mesh(new THREE.SphereGeometry(0.09, 6, 6),
-      new THREE.MeshBasicMaterial({ color: 0xffc06a, transparent: true, opacity: 0 }));
-    scene.add(m);
-    sparks.push({ mesh: m, ttl: 0 });
-  }
-  // --- pooled smoke spheres (rendered from sim state) ---
-  const smokeMeshes = [];
-  for (let i = 0; i < 6; i++) {
-    const m = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 10),
-      new THREE.MeshBasicMaterial({ color: 0xb8b8b8, transparent: true, opacity: 0, depthWrite: false }));
-    m.visible = false;
-    scene.add(m);
-    smokeMeshes.push(m);
-  }
-  let tracerIdx = 0, sparkIdx = 0;
-
-  return {
-    bomb, bombLight, tracers, sparks, smokeMeshes,
-    fireTracer(from, to) {
-      const t = tracers[tracerIdx]; tracerIdx = (tracerIdx + 1) % tracers.length;
-      const p = t.line.geometry.attributes.position.array;
-      p[0] = from.x; p[1] = from.y; p[2] = from.z;
-      p[3] = to.x; p[4] = to.y; p[5] = to.z;
-      t.line.geometry.attributes.position.needsUpdate = true;
-      t.line.material.opacity = 0.95;
-      t.ttl = 0.07;
-    },
-    fireSpark(at) {
-      const s = sparks[sparkIdx]; sparkIdx = (sparkIdx + 1) % sparks.length;
-      s.mesh.position.set(at.x, at.y, at.z);
-      s.mesh.material.opacity = 1;
-      s.mesh.scale.setScalar(1);
-      s.ttl = 0.18;
-    },
-    update(dt, S) {
-      for (const t of tracers) {
-        if (t.ttl > 0) {
-          t.ttl -= dt;
-          t.line.material.opacity = Math.max(0, t.ttl / 0.07) * 0.95;
-        }
-      }
-      for (const s of sparks) {
-        if (s.ttl > 0) {
-          s.ttl -= dt;
-          s.mesh.material.opacity = Math.max(0, s.ttl / 0.18);
-          s.mesh.scale.setScalar(1 + (0.18 - s.ttl) * 6);
-        }
-      }
-      // Bomb: blink faster as the timer runs down.
-      if (S.bomb.state === 'planted') {
-        bomb.visible = true;
-        bomb.position.set(S.bomb.x, 0.18, S.bomb.z);
-        const rate = S.bomb.timer < 10 ? 10 : 3;
-        bombLight.material.color.setHex(Math.sin(performance.now() / 1000 * rate * Math.PI) > 0 ? 0xff2a1a : 0x550000);
-      } else {
-        bomb.visible = false;
-      }
-      // Smoke clouds from sim state.
-      smokeMeshes.forEach((m, i) => {
-        const s = S.smokes[i];
-        if (s && s.ttl > 0) {
-          m.visible = true;
-          m.position.set(s.x, s.y, s.z);
-          m.scale.setScalar(s.r);
-          m.material.opacity = 0.5 * Math.min(1, s.ttl / 2);
-        } else {
-          m.visible = false;
-        }
-      });
-    },
-  };
 }

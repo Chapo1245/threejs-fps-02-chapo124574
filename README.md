@@ -1,69 +1,60 @@
-# EMBER YARD — tactical FPS (make.fun threejs-fps-02)
+# EMBER YARD v3 — Slagworks
 
-[![make.fun · threejs-fps-02](https://make.fun/badge/threejs-fps-02.svg)](https://make.fun/bounty/threejs-fps-02)
-[![rank](https://make.fun/badge/threejs-fps-02/Chapo1245/threejs-fps-02-chapo124574/rank.svg)](https://make.fun/bounty/threejs-fps-02/leaderboard)
-[![reward](https://make.fun/badge/threejs-fps-02/Chapo1245/threejs-fps-02-chapo124574/reward.svg)](https://make.fun/bounty/threejs-fps-02)
+[![make.fun · threejs-fps-02](https://make.fun/badge/threejs-fps-02.svg)](https://make.fun/bounty/threejs-fps-02?utm_source=github&utm_medium=readme&utm_campaign=threejs-fps-02)
+[![rank](https://make.fun/badge/threejs-fps-02/Chapo1245/threejs-fps-02-chapo124574/rank.svg)](https://make.fun/bounty/threejs-fps-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=threejs-fps-02)
+[![reward](https://make.fun/badge/threejs-fps-02/Chapo1245/threejs-fps-02-chapo124574/reward.svg)](https://make.fun/bounty/threejs-fps-02?utm_source=github&utm_medium=readme&utm_campaign=threejs-fps-02)
 
-A round-based tactical FPS in the Counter-Strike style, built on
-three.js 0.187.0. Static files only — no build step, no network.
-
-## Play
-
-Serve `game/` with any static server and open `index.html` in desktop
-Chrome (WebGL 2):
-
-```sh
-npx serve game   # or: python3 -m http.server -d game 8080
-```
-
-Click to play. You are VANGUARD (attackers, blue) against the JACKALS
-(defenders, amber) on **Yard 7**, a freight yard at dusk. Plant the bomb
-at site A (crane yard) or B (warehouse), or eliminate the enemy team.
-First to 8 rounds takes the match.
-
-- **WASD** move · **Mouse** aim · **Click** fire · **Right click** aim down sights
-- **Shift** sprint · **Ctrl / C** crouch · **Space** jump · **R** reload
-- **1 / 2** weapons · **4 / 5 / 6 / Q / G** grenades · **E** plant the bomb
-- **B** buy menu (buy phase) · **Esc** pause
+A round-based tactical FPS in the browser, built on three.js 0.187.0 — no build step, no network, just static files. Entered on [make.fun](https://make.fun/bounty/threejs-fps-02) for the **threejs-fps-02** bounty.
 
 ## The game
 
-- **Gunplay:** hitscan against body/head spheres (headshots deal 3x),
-  recoil that kicks the view, spread that blooms per shot and grows while
-  moving or airborne — stopping to aim pays. Five weapons (P9, VK-47,
-  Hornet SMG, Longbow DMR, Breacher shotgun) plus frag, smoke and flash
-  grenades, kevlar, and a per-round economy with a buy menu.
-- **Bots:** four teammates and five enemies with a state machine — lane
-  routes over a waypoint graph, hold angles, peek, react to gunfire they
-  hear, push or fall back, plant and defuse. They see through line of
-  sight and field of view; smoke blocks their sight.
-- **Rounds:** 100-second rounds, 15-second buy phases, bomb timer,
-  elimination / plant / defuse / timeout endings, loss-streak bonuses,
-  first to 8.
-- **Map:** an original freight yard — A-long, mid doors, B-long, a crane
-  yard and a warehouse, built from one data file (`game/src/map.js`).
+You are the Ember Crew attacker carrying the charge. Five versus five, first to five rounds, plant-and-defuse at two sites — with a buy economy between rounds and bots that actually play the map.
 
-## Code
+- **Three original maps** — Slagworks (dusk foundry yard, 3 lanes), Night Dock (harbour at night, long sniper sightlines), Cinder Pit (compact arena, fast rounds). Pick one on the menu; Slagworks is the default.
+- **Gunplay where stopping to aim pays** — headshot bonus damage, recoil bloom, spread that grows with movement and while airborne, acceleration-based movement, crouch, jump, and AABB collision.
+- **Tactics** — plant the charge (hold E in a site) or wipe the defenders; money per round for kills, plants and wins, spent in a buy menu (rifle, SMG, shotgun, sniper, frag and smoke grenades, armour, ammo). Bots follow waypoint routes, hold sites, react to sight and sound, strafe in fights, plant, defuse and retake.
+- **Feedback for everything** — hitmarkers, kill feed, damage direction, bomb beeps, round banners, a live minimap, and synthesized WebAudio sound (no audio files).
+- **Built for heavy firefights** — pooled tracers and particles, instanced map geometry, one small shadow map, capped pixel ratio on touch, and adaptive quality that sheds resolution instead of frames.
 
-One job per module under `game/src/`: `state` (the single store),
-`config` (all tuning), `map` (the map data), `world` (three.js scene +
-collision/LOS), `player` (movement + look), `weapons` (spread, recoil,
-reload, buying), `combat` (hits, damage, grenades), `bots` (AI),
-`rounds` (match clock + economy), `hud` (DOM + minimap), `audio`
-(synthesized sounds), `util` (math + collision primitives). The
-simulation runs at a fixed 60 Hz step, apart from rendering, with no
-per-frame allocations in the hot loops.
+## Controls
 
-## Entry program
+| Key | Action |
+| --- | --- |
+| W A S D / mouse | Move / aim (click the game to lock the pointer) |
+| Click | Fire · R reload · 1–3 weapons · Q last weapon |
+| E (hold) | Plant the charge inside a site |
+| G | Grenade (frag / smoke) · B buy menu · Shift walk silent |
+| C crouch · Space jump · Esc pause · Tab scoreboard |
 
-`main.ts` (Node 22, stdlib only) copies `game/` and `screenshots/` to
-the output directory and writes `dossier.json` with the kit's
-`buildDossier`:
+## Play it
+
+Serve `game/` with any static server and open `index.html` in desktop Chrome (WebGL 2):
 
 ```sh
-mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+python3 -m http.server --directory game
+# open http://localhost:8000
 ```
+
+## Layout
+
+- `game/index.html` — HUD, menus, import map
+- `game/src/main.js` — boot, fixed-step loop, round state machine
+- `game/src/state.js` — the single state store
+- `game/src/config.js` — weapons, economy, the three variants
+- `game/src/layouts.js` — the three original maps
+- `game/src/world.js` — scene build, collision, line of sight
+- `game/src/bots.js` — bot AI (routes, holds, vision, hearing, plant/defuse)
+- `game/src/combat.js` — hitscan, headshots, grenades, explosions
+- `game/src/weapons.js` — arsenal, recoil, spread, reload, buy shop
+- `game/src/player.js` — movement physics
+- `game/src/input.js` — keyboard, mouse, pointer lock, touch
+- `game/src/render.js` — renderer, pooled tracers/particles, viewmodel
+- `game/src/audio.js` — synthesized sound effects
+- `game/src/hud.js` — HUD, minimap, buy menu, banners
+- `main.ts` — the make.fun entry program (copies `game/` + `screenshots/`, writes `dossier.json`)
 
 ## License
 
-MIT — see `LICENSE`.
+MIT — see [LICENSE](LICENSE).
+
+<sub>Entered on [make.fun](https://make.fun/?ref=wtacm6ft&utm_source=github&utm_medium=readme&utm_campaign=threejs-fps-02) · AI agents build software for cash rewards</sub>
