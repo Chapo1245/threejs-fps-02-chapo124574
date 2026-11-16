@@ -1,151 +1,74 @@
-// weapons.js — the arsenal: firing, recoil, spread, reload, ammo,
-// grenades, and the buy shop. Pure-ish logic: it owns weapon state
-// per fighter (player or bot) and asks combat.js to resolve shots.
-// Stopping to aim pays: spread = base + move * speed + air, and
-// recoil blooms with consecutive shots, recovering when you pause.
+// weapons.js — every gun, grenade and piece of kit in the buy menu, plus the
+// pure firing math (spread, recoil, damage falloff). No rendering here: combat.js
+// turns a shot into a ray, bots.js asks for the same numbers for bot accuracy.
+export const WEAPONS = {
+  // id: {name, price, damage, headMul, rpm, mag, reserve, spread, moveSpread,
+  //      recoil, zoom (ADS fov), range, auto, kick (view kick per shot)}
+  sidearm: { name: 'P9 SIDEARM', price: 0, damage: 34, headMul: 2.0, rpm: 380, mag: 12, reserve: 48, spread: 0.011, moveSpread: 0.030, recoil: 0.006, zoom: 1.0, range: 42, auto: false, kick: 0.010, reload: 1.4 },
+  smg: { name: 'VK-9 SMG', price: 1500, damage: 26, headMul: 1.8, rpm: 750, mag: 32, reserve: 128, spread: 0.016, moveSpread: 0.034, recoil: 0.005, zoom: 1.0, range: 34, auto: true, kick: 0.008, reload: 1.9 },
+  rifle: { name: 'AR-77 RIFLE', price: 2700, damage: 33, headMul: 2.2, rpm: 600, mag: 30, reserve: 90, spread: 0.008, moveSpread: 0.026, recoil: 0.009, zoom: 1.15, range: 60, auto: true, kick: 0.014, reload: 2.2 },
+  marksman: { name: 'DMR-12 MARKSMAN', price: 4200, damage: 78, headMul: 2.5, rpm: 90, mag: 10, reserve: 30, spread: 0.002, moveSpread: 0.045, recoil: 0.030, zoom: 2.2, range: 90, auto: false, kick: 0.05, reload: 2.8 },
+  shotgun: { name: 'M590 BREACHER', price: 1800, damage: 13, headMul: 1.6, rpm: 70, mag: 6, reserve: 30, spread: 0.042, moveSpread: 0.05, recoil: 0.022, zoom: 1.0, range: 18, auto: false, kick: 0.035, reload: 2.6, pellets: 8 },
+};
 
-import { WEAPONS, GRENADES, ARMOR_PRICE, AMMO_PRICE } from './config.js';
-import { clamp } from './state.js';
+export const GRENADES = {
+  frag: { name: 'FRAG GRENADE', price: 300, radius: 6.5, damage: 110, fuse: 1.6 },
+  smoke: { name: 'SMOKE GRENADE', price: 300, radius: 5, duration: 14 },
+  flash: { name: 'FLASHBANG', price: 200, radius: 16, duration: 2.6 },
+};
 
-export function makeLoadout(startWeapon) {
-  return {
-    primary: startWeapon || 'rifle',
-    secondary: 'pistol',
-    slot: 1,            // 1 primary, 2 pistol, 3 grenade
-    lastSlot: 2,
-    grenades: { frag: 0, smoke: 0 },
-    grenadeSel: 'frag',
-    ammo: {},           // id -> {mag, reserve}
-    cooldown: 0,
-    reloadT: 0,
-    reloading: null,
-    bloom: 0,           // recoil bloom 0..1
-    scoped: false,
-    throwT: 0,
-  };
+export const KIT = {
+  kevlar: { name: 'KEVLAR VEST', price: 650, note: 'Halves all damage taken' },
+  defuseKit: { name: 'DEFUSE KIT', price: 400, note: 'Defuse in 2.5s instead of 5s' },
+};
+
+export const BUY_LIST = [
+  { kind: 'weapon', id: 'smg', key: '1' },
+  { kind: 'weapon', id: 'rifle', key: '2' },
+  { kind: 'weapon', id: 'shotgun', key: '3' },
+  { kind: 'weapon', id: 'marksman', key: '4' },
+  { kind: 'grenade', id: 'frag', key: '5' },
+  { kind: 'grenade', id: 'smoke', key: '6' },
+  { kind: 'grenade', id: 'flash', key: '7' },
+  { kind: 'kit', id: 'kevlar', key: '8' },
+  { kind: 'kit', id: 'defuseKit', key: '9' },
+];
+
+// A live gun instance on an actor: ammo state + transient recoil/spread bloom.
+export function makeGun(id) {
+  const def = WEAPONS[id];
+  return { id, def, mag: def.mag, reserve: def.reserve, reloading: 0, bloom: 0, lastShot: -99, burst: 0 };
 }
 
-export function initAmmo(loadout) {
-  for (const id of ['pistol', 'rifle', 'smg', 'shotgun', 'sniper']) {
-    const w = WEAPONS[id];
-    loadout.ammo[id] = { mag: w.mag, reserve: w.reserve };
-  }
-}
-
-export function currentWeapon(loadout) {
-  if (loadout.slot === 2) return WEAPONS.pistol;
-  if (loadout.slot === 3) return null;
-  return WEAPONS[loadout.primary] || WEAPONS.pistol;
-}
-
-export function switchSlot(loadout, slot) {
-  if (slot === 'last') {
-    const t = loadout.slot; loadout.slot = loadout.lastSlot; loadout.lastSlot = t;
-  } else if (slot === 'next' || slot === 'prev') {
-    const order = [1, 2, 3];
-    let i = order.indexOf(loadout.slot);
-    i = (i + (slot === 'next' ? 1 : order.length - 1)) % order.length;
-    loadout.lastSlot = loadout.slot;
-    loadout.slot = order[i];
-  } else if (slot >= 1 && slot <= 3) {
-    if (slot !== loadout.slot) { loadout.lastSlot = loadout.slot; loadout.slot = slot; }
-  }
-  loadout.reloading = null; loadout.reloadT = 0;
-  loadout.scoped = false;
-  return currentWeapon(loadout);
-}
-
-// Spread in radians for this fighter right now.
-export function currentSpread(w, moveMag, airborne, bloom, scoped) {
-  let s = w.spread + w.moveSpread * moveMag + (airborne ? w.airSpread : 0);
-  s += bloom * 0.02;
-  if (scoped) s *= 0.25;
+// Spread in radians for a shot: base + movement + air + bloom, reduced by ADS/crouch.
+// Standing still and aiming down sights is how you win a duel — by design.
+export function shotSpread(gun, actor, ads) {
+  const def = gun.def;
+  let s = def.spread + gun.bloom;
+  s += def.moveSpread * actor.moveMag;
+  if (!actor.onGround) s += 0.03;
+  if (actor.crouch) s *= 0.55;
+  if (ads) s *= 0.55;
   return s;
 }
 
-export function tickLoadout(loadout, dt) {
-  loadout.cooldown = Math.max(0, loadout.cooldown - dt);
-  loadout.throwT = Math.max(0, loadout.throwT - dt);
-  loadout.bloom = Math.max(0, loadout.bloom - dt * 1.6);
-  if (loadout.reloading) {
-    loadout.reloadT -= dt;
-    if (loadout.reloadT <= 0) {
-      const w = WEAPONS[loadout.reloading];
-      const a = loadout.ammo[loadout.reloading];
-      const need = w.mag - a.mag;
-      const take = Math.min(need, a.reserve);
-      a.mag += take; a.reserve -= take;
-      loadout.reloading = null;
-    }
-  }
+// Damage at range with falloff and the headshot multiplier; kevlar halves it.
+export function shotDamage(gun, distance, headshot, target) {
+  const def = gun.def;
+  let fall = 1;
+  if (distance > def.range * 0.6) fall = 1 - 0.45 * ((distance - def.range * 0.6) / (def.range * 0.4));
+  let dmg = def.damage * (headshot ? def.headMul : 1) * Math.max(0.55, fall);
+  if (target.armor > 0) dmg *= 0.5;
+  return dmg;
 }
 
-export function startReload(loadout, sfx) {
-  const w = currentWeapon(loadout);
-  if (!w || loadout.reloading) return false;
-  const a = loadout.ammo[w.id];
-  if (a.mag >= w.mag || a.reserve <= 0) return false;
-  loadout.reloading = w.id;
-  loadout.reloadT = w.reload;
-  if (sfx) sfx.reload();
-  return true;
-}
+// Seconds between shots for this gun.
+export function shotInterval(gun) { return 60 / gun.def.rpm; }
 
-// Returns 'fired' | 'dry' | 'reload' | 'cool' | 'throw' | null.
-export function tryFire(loadout, w, sfx) {
-  if (!w) return null;
-  if (loadout.cooldown > 0 || loadout.reloading) return 'cool';
-  const a = loadout.ammo[w.id];
-  if (a.mag <= 0) {
-    loadout.cooldown = 0.25;
-    if (sfx) sfx.dryFire();
-    return 'dry';
-  }
-  a.mag -= 1;
-  loadout.cooldown = w.interval;
-  loadout.bloom = clamp(loadout.bloom + (w.kind === 'sniper' ? 0.9 : w.kind === 'shotgun' ? 0.7 : 0.22), 0, 1);
-  return 'fired';
+// Recoil: each shot adds kick to the shooter's pitch and bloom to the spread;
+// bloom decays in sim.tick. Returns the pitch kick in radians.
+export function applyRecoil(gun) {
+  gun.bloom = Math.min(0.05, gun.bloom + gun.def.recoil * 0.55);
+  return gun.def.kick;
 }
-
-export function throwGrenade(loadout, kind) {
-  if (loadout.grenades[kind] <= 0 || loadout.throwT > 0) return null;
-  loadout.grenades[kind] -= 1;
-  loadout.throwT = 0.6;
-  return GRENADES[kind];
-}
-
-// --- Buy shop ---------------------------------------------------------
-// items: id -> {label, price, group}. Groups keep each decision point
-// at four options or fewer (≤4 visible choices per group).
-export const SHOP = [
-  { id: 'rifle', label: 'VK-47 Ember — Rifle', price: 2700, group: 'Rifles', key: '1' },
-  { id: 'smg', label: 'Rasp-9 — SMG', price: 1500, group: 'Rifles', key: '2' },
-  { id: 'shotgun', label: 'Boomstick 12', price: 1100, group: 'Rifles', key: '3' },
-  { id: 'sniper', label: 'Longshot .50', price: 4750, group: 'Rifles', key: '4' },
-  { id: 'frag', label: 'Spark Frag', price: 300, group: 'Utility', key: '5' },
-  { id: 'smoke', label: 'Haze Smoke', price: 300, group: 'Utility', key: '6' },
-  { id: 'armor', label: 'Vest + Helmet (100)', price: ARMOR_PRICE, group: 'Utility', key: '7' },
-  { id: 'ammo', label: 'Refill reserve ammo', price: AMMO_PRICE, group: 'Utility', key: '8' },
-];
-
-export function buyItem(S, loadout, player, id) {
-  const item = SHOP.find((s) => s.id === id);
-  if (!item || S.money < item.price) return false;
-  if (id === 'armor') {
-    if (player.armor >= 100) return false;
-    player.armor = 100;
-  } else if (id === 'ammo') {
-    for (const wid of Object.keys(loadout.ammo)) {
-      loadout.ammo[wid].reserve = WEAPONS[wid].reserve;
-    }
-  } else if (id === 'frag' || id === 'smoke') {
-    if (loadout.grenades[id] >= 2) return false;
-    loadout.grenades[id] += 1;
-  } else {
-    loadout.primary = id;
-    loadout.ammo[id] = { mag: WEAPONS[id].mag, reserve: WEAPONS[id].reserve };
-    loadout.slot = 1;
-  }
-  S.money -= item.price;
-  return true;
-}
+export function decayBloom(gun, dt) { gun.bloom = Math.max(0, gun.bloom - dt * 0.045); }

@@ -1,350 +1,299 @@
-// bots.js — bot AI: waypoint routes, hold positions, vision cones,
-// hearing, burst fire, bomb plant / defuse / retake.
-// Bots share what they see (lastKnown) with a 1s delay, react after a
-// human-like delay, and fire the same combat.fire path as the player,
-// so bot accuracy is honest, not scripted damage.
+// bots.js — the bot brain. Bots run the same movement, weapons and damage code
+// as the player (actors.js / combat.js); this file only decides WHAT they do:
+// routes from the nav graph, holds, vision, hearing, grenades, radio callouts.
+// A bot's skill (0.35..0.8) sets its aim error, reaction time and burst length.
+import { clamp, dist2, angleDiff, angleLerp } from './state.js';
+import { moveActor, eyeHeight } from './actors.js';
+import { fireShot, throwGrenade, tryPlant, tryDefuse, siteOf } from './combat.js';
+import { losBlocked, nearestNode, findPath } from './world.js';
 
-import * as THREE from 'three';
-import { WEAPONS } from './config.js';
-import { clamp } from './state.js';
-import { makeLoadout, initAmmo, currentWeapon, tickLoadout, tryFire, startReload, currentSpread } from './weapons.js';
+const VISION_RANGE = 42;      // metres — beyond this a bot cannot spot you
+const VISION_FOV = 1.9;       // radians of half-angle the bot can see
+const HEARING_RANGE = 30;     // gunfire heard inside this radius
+const BOT_NAMES_A = ['Rook', 'Cinder', 'Moss', 'Pike', 'Wren'];
+const BOT_NAMES_B = ['Holt', 'Brass', 'Slate', 'Fenn', 'Odo'];
 
-const BOT_SPEED = 4.3;
-const SCAN_INTERVAL = 0.14;
-const VIEW_DIST = 48;
-const FOV_COS = 0.45; // ~63 deg half-angle
-
-const _v = { x: 0, z: 0 };
-
-export class Bots {
-  constructor(S, world, render, sfx, combat, hooks) {
-    this.S = S;
-    this.world = world;
-    this.render = render;
-    this.sfx = sfx;
-    this.combat = combat;
-    this.hooks = hooks;
-    this.list = [];
+export function makeBotTeam(state, rng) {
+  // The human player is always RIVETS (attack); 4 bot teammates + 5 defenders.
+  const bots = [];
+  for (let i = 0; i < 4; i++) {
+    const b = state.actors[1 + i];
+    b.bot.skill = 0.5 + rng() * 0.2;
+    b.bot.site = rng() < 0.5 ? 'A' : 'B';
+    b.bot.lane = i % 3;
   }
-
-  spawnRound(planSite, difficulty) {
-    const S = this.S;
-    const layout = this.world.layout;
-    const variant = S.variantCfg;
-    // Reuse meshes across rounds; create once.
-    if (this.list.length === 0) {
-      for (let i = 0; i < 9; i++) {
-        const team = i < 4 ? 'atk' : 'def';
-        const mesh = this.render.makeBotMesh(team);
-        this.render.scene.add(mesh);
-        this.list.push({ mesh, team, id: i });
-      }
-    }
-    const atkGuns = ['rifle', 'rifle', 'smg', 'shotgun'];
-    const defGuns = ['rifle', 'rifle', 'sniper', 'smg', 'rifle'];
-    const atkRoutes = planSite === 'A'
-      ? ['atkA', 'atkMid', 'atkB', 'atkA']
-      : ['atkB', 'atkMid', 'atkA', 'atkB'];
-    const defHolds = ['defA', 'defB', 'defMid', 'defA', 'defB'];
-    S.bots = this.list;
-    for (let i = 0; i < 9; i++) {
-      const b = this.list[i];
-      const isAtk = i < 4;
-      const spawn = isAtk ? layout.spawns.atk[i + 1] : layout.spawns.def[i - 4];
-      b.name = isAtk ? S.atkNames[i] : S.defNames[i - 4];
-      b.pos = { x: spawn.x, y: 0, z: spawn.z };
-      b.vel = { x: 0, z: 0 };
-      b.yaw = spawn.yaw;
-      b.hp = 100; b.armor = isAtk ? 0 : 25;
-      b.alive = true;
-      b.loadout = makeLoadout(isAtk ? atkGuns[i] : defGuns[i - 4]);
-      initAmmo(b.loadout);
-      for (const k of Object.keys(b.loadout.ammo)) b.loadout.ammo[k].reserve = 999;
-      b.role = isAtk ? atkRoutes[i] : defHolds[i - 4];
-      b.route = layout.routes[b.role].slice();
-      b.routeIdx = 0;
-      b.state = 'move';
-      b.target = null;
-      b.lastSeen = null;
-      b.lastKnownShared = null;
-      b.reactT = 0;
-      b.scanT = 0.1 + i * 0.02;
-      b.burstLeft = 0;
-      b.burstPause = 0;
-      b.fireT = 0;
-      b.strafeDir = 1;
-      b.strafeT = 0;
-      b.holdNode = null;
-      b.isCarrier = false;
-      b.channel = null; // {kind:'plant'|'defuse', t, dur}
-      b.hearT = -99;
-      // Difficulty scales the variant's bot profile per bot.
-      const dm = S.difficulty === 'hard' ? { r: 0.85, a: 1.12 } : S.difficulty === 'easy' ? { r: 1.3, a: 0.85 } : { r: 1, a: 1 };
-      b.skill = {
-        reaction: variant.bot.reaction * dm.r,
-        accuracy: clamp(variant.bot.accuracy * dm.a, 0.1, 0.9),
-        aggression: variant.bot.aggression,
-        holdBias: variant.bot.holdBias,
-      };
-      b.aimErr = 0;
-      b.mesh.visible = true;
-      b.mesh.rotation.set(0, b.yaw, 0);
-      b.mesh.position.set(b.pos.x, 0, b.pos.z);
-      b.mesh.scale.set(1, 1, 1);
-      b.fallT = 0;
-    }
-    // Attackers pick a site plan; defenders spread to holds.
-    S.planSite = planSite;
+  for (let i = 0; i < 5; i++) {
+    const b = state.actors[5 + i];
+    b.bot.skill = 0.45 + rng() * 0.25;
+    b.bot.site = i < 3 ? 'A' : 'B';
+    b.bot.lane = i % 3;
   }
+  return bots;
+}
 
-  // One bot's scan: nearest visible enemy, plus hearing.
-  _scan(b, dt) {
-    const S = this.S;
-    b.scanT -= dt;
-    if (b.scanT > 0) return;
-    b.scanT = SCAN_INTERVAL;
-    const eyeY = 1.55;
-    let best = null, bestD = Infinity;
-    for (let i = 0; i < S.targets.length; i++) {
-      const tg = S.targets[i];
-      if (!tg.alive || tg.team === b.team) continue;
-      const dx = tg.x - b.pos.x, dz = tg.z - b.pos.z;
-      const d = Math.hypot(dx, dz);
-      if (d > VIEW_DIST || d < 0.4) continue;
-      if (d > 3) {
-        // FOV check against facing.
-        const fx = -Math.sin(b.yaw), fz = -Math.cos(b.yaw);
-        if ((dx * fx + dz * fz) / d < FOV_COS) continue;
-      }
-      if (!this.world.hasLOS(b.pos.x, eyeY, b.pos.z, tg.x, 1.45, tg.z, S.smokes)) continue;
-      if (d < bestD) { bestD = d; best = tg; }
-    }
-    if (best) {
-      if (b.target !== best.ref) {
-        // First sight: reaction delay before the first shot.
-        b.reactT = b.skill.reaction * (0.8 + S.rng() * 0.5);
-        b.burstLeft = 0; b.burstPause = 0;
-      }
-      b.target = best.ref;
-      b.lastSeen = { x: best.x, z: best.z, t: S.time };
-      b.lastKnownShared = { x: best.x, z: best.z, t: S.time };
-    } else {
-      b.target = null;
-    }
-    // Hearing: enemy shots within 28m reveal a position (no exact aim).
-    for (let i = 0; i < S.shotEvents.length; i++) {
-      const ev = S.shotEvents[i];
-      if (ev.t <= b.hearT || ev.team === b.team) continue;
-      const d = Math.hypot(ev.x - b.pos.x, ev.z - b.pos.z);
-      if (d < 28) {
-        b.hearT = ev.t;
-        b.lastSeen = { x: ev.x + (S.rng() - 0.5) * 4, z: ev.z + (S.rng() - 0.5) * 4, t: S.time };
+// Assign each bot a job for the round: attackers pick a site + lane, defenders
+// take a hold position; the spike carrier is the highest-skill attacker.
+export function assignRoundJobs(state, rng) {
+  const atk = state.actors.filter(a => a.team === 'A' && a.alive);
+  const def = state.actors.filter(a => a.team === 'B' && a.alive);
+  state.targetSite = rng() < 0.5 ? 'A' : 'B';
+  let carrier = null, bestSkill = -1;
+  for (const a of atk) {
+    if (a.isPlayer) continue;
+    a.bot.site = Math.random() < 0.62 ? state.targetSite : (state.targetSite === 'A' ? 'B' : 'A');
+    if (a.bot.skill > bestSkill) { bestSkill = a.bot.skill; carrier = a; }
+  }
+  const human = state.actors.find(a => a.isPlayer);
+  if (human && !atk.some(a => a.hasSpike)) { /* human may pick the spike up */ }
+  if (carrier) { for (const a of atk) a.hasSpike = false; carrier.hasSpike = true; }
+  for (let i = 0; i < def.length; i++) {
+    const b = def[i];
+    const holds = state.map.holds[b.bot.site] || state.map.holds.A;
+    const hold = holds[i % holds.length];
+    // Walk the nav graph to the hold, then sit on it (never a straight line
+    // through the buildings — that wedges bots against walls).
+    b.bot.holdPos = hold;
+    b.bot.state = 'route';
+    b.bot.path = planRoute(state, b, hold.node);
+    b.bot.node = 0;
+  }
+  for (const a of atk) {
+    if (a.isPlayer) continue;
+    a.bot.state = 'route';
+    a.bot.path = planRoute(state, a, siteNode(state, a.bot.site));
+    a.bot.node = 0;
+  }
+}
+function siteNode(state, site) {
+  return site === 'A' ? state.map.nodes.findIndex(n => n.x === 19 && n.z === -13)
+    : state.map.nodes.findIndex(n => n.x === -19 && n.z === -13);
+}
+export function planRoute(state, actor, goalNode) {
+  const from = nearestNode(state.map, actor.pos.x, actor.pos.z);
+  return findPath(state.map, from, goalNode);
+}
+
+// --- Vision: can `bot` see `other` right now? ------------------------------
+export function canSee(state, world, bot, other) {
+  if (!other.alive) return false;
+  const d2 = dist2(bot.pos.x, bot.pos.z, other.pos.x, other.pos.z);
+  if (d2 > VISION_RANGE * VISION_RANGE) return false;
+  const dx = other.pos.x - bot.pos.x, dz = other.pos.z - bot.pos.z;
+  const d = Math.sqrt(d2) || 1;
+  const toTarget = Math.atan2(-dx, -dz); // yaw convention: forward = (-sin, -cos)
+  if (Math.abs(angleDiff(bot.yaw, toTarget)) > VISION_FOV && d > 6) return false;
+  if (losBlocked(world.colliders, bot.pos.x, bot.pos.z, other.pos.x, other.pos.z)) return false;
+  // Smoke blocks vision: a smoke cloud between the two hides the target.
+  if (state.smokes) for (const s of state.smokes) {
+    if (segmentNearPoint(bot.pos.x, bot.pos.z, other.pos.x, other.pos.z, s.x, s.z, 3.2)) return false;
+  }
+  // Crouching + far + still is harder to spot; moving in the open is easy.
+  const spot = 0.35 + other.moveMag * 0.5 + (other.crouch ? -0.15 : 0) + (d < 12 ? 0.35 : 0);
+  return Math.random() < Math.min(1, spot + bot.bot.skill * 0.3);
+}
+function segmentNearPoint(ax, az, bx, bz, px, pz, r) {
+  const dx = bx - ax, dz = bz - az;
+  const len2 = dx * dx + dz * dz || 1;
+  let t = ((px - ax) * dx + (pz - az) * dz) / len2;
+  t = clamp(t, 0, 1);
+  const cx = ax + dx * t, cz = az + dz * t;
+  return (cx - px) * (cx - px) + (cz - pz) * (cz - pz) < r * r;
+}
+
+// --- The tick: one bot, one fixed step. -------------------------------------
+export function tickBot(state, world, bot, dt, rng) {
+  const brain = bot.bot;
+  if (!bot.alive || !brain) return;
+  bot.flash = Math.max(0, bot.flash - dt);
+  if (bot.flash > 0.4) { moveActor(bot, { f: 0, s: 0 }, dt, world.colliders); return; } // blind: freeze
+
+  // Hearing: a loud shot nearby becomes an investigate point (bots react to
+  // what they hear, not just what they see).
+  for (const s of state.shots) {
+    if (s.loud && dist2(bot.pos.x, bot.pos.z, s.x, s.z) < HEARING_RANGE * HEARING_RANGE) {
+      if (state.time - brain.reactAt > 1.5) {
+        brain.investigate = { x: s.x, z: s.z };
+        brain.reactAt = state.time;
+        if (brain.state === 'hold') brain.state = 'investigate';
       }
     }
   }
 
-  update(dt) {
-    const S = this.S;
-    for (const b of this.list) {
-      if (!b.alive) {
-        if (b.fallT > 0) {
-          b.fallT -= dt;
-          b.mesh.rotation.x = Math.min(Math.PI / 2, b.mesh.rotation.x + dt * 5);
-          if (b.fallT <= 0) b.mesh.visible = false;
-        }
-        continue;
-      }
-      this._scan(b, dt);
-      tickLoadout(b.loadout, dt);
-      // Channel (plant/defuse): stand still, abort if an enemy is close.
-      if (b.channel) {
-        const ch = b.channel;
-        ch.t += dt;
-        let near = false;
-        if (b.target && b.target.alive) {
-          const tx = b.target.pos ? b.target.pos.x : b.target.x;
-          const tz = b.target.pos ? b.target.pos.z : b.target.z;
-          near = Math.hypot(tx - b.pos.x, tz - b.pos.z) < 8;
-        }
-        if (near) { b.channel = null; }
-        else if (ch.t >= ch.dur) {
-          this.hooks.onChannelDone(b, ch.kind);
-          b.channel = null;
-        }
-        this._faceTarget(b, dt);
-        this._syncMesh(b, dt, 0);
-        continue;
-      }
-      if (b.target && b.target.alive) {
-        this._engage(b, dt);
+  // Vision scan: nearest visible enemy becomes the target.
+  let target = null, targetD = Infinity;
+  for (const other of state.actors) {
+    if (other.team === bot.team || !other.alive) continue;
+    const d = Math.sqrt(dist2(bot.pos.x, bot.pos.z, other.pos.x, other.pos.z));
+    if (d < targetD && canSee(state, world, bot, other)) { target = other; targetD = d; }
+  }
+  if (target) { brain.target = target; brain.lastSeen = { x: target.pos.x, z: target.pos.z }; brain.lastSeenAt = state.time; }
+  else if (state.time - brain.lastSeenAt > 2.5) brain.target = null;
+
+  const bomb = state.bomb;
+  // Role overrides: plant the spike, defuse it, or retake the site.
+  if (bot.hasSpike && brain.state !== 'plant' && siteOf(state, bot)) brain.state = 'plant';
+  if (bomb.state === 'planted' && bot.team === 'B' && brain.state !== 'defuse' && brain.state !== 'retake') {
+    brain.state = 'retake';
+    brain.path = planRoute(state, bot, siteNode(state, bomb.site));
+    brain.node = 0;
+    radio(state, bot, bomb.site === 'A' ? 'Spike down on A — retaking!' : 'Spike down on B — retaking!');
+  }
+  if (bomb.state === 'planted' && bot.team === 'A' && brain.state !== 'guard') {
+    brain.state = 'guard';
+    brain.path = planRoute(state, bot, siteNode(state, bomb.site));
+    brain.node = 0;
+  }
+
+  const input = { f: 0, s: 0, jump: false, crouch: false, ads: false, sprint: false };
+  if (brain.target) {
+    // Engage: face the target, strafe, fire in bursts sized by skill.
+    const t = brain.target;
+    const wantYaw = Math.atan2(-(t.pos.x - bot.pos.x), -(t.pos.z - bot.pos.z));
+    bot.yaw = angleLerp(bot.yaw, wantYaw, clamp(dt * (6 + brain.skill * 6), 0, 1));
+    const d = Math.sqrt(dist2(bot.pos.x, bot.pos.z, t.pos.x, t.pos.z));
+    if (state.time > brain.strafeUntil) {
+      brain.strafeDir = Math.random() < 0.5 ? -1 : 1;
+      brain.strafeUntil = state.time + 0.5 + Math.random() * 0.9;
+      brain.crouch = Math.random() < 0.25;
+    }
+    input.s = brain.strafeDir * 0.6;
+    input.crouch = brain.crouch && d > 10;
+    input.ads = d > 14;
+    // Fire in bursts: high skill = longer bursts, shorter pauses.
+    const gun = bot.weapons[bot.slot];
+    if (gun && gun.mag > 0 && state.time >= brain.nextShotAt) {
+      if (brain.burstLeft <= 0) {
+        brain.burstLeft = 2 + Math.floor(rng() * (2 + brain.skill * 5));
+        brain.nextShotAt = state.time + 0.25 + rng() * 0.45 * (1 - brain.skill * 0.5);
       } else {
-        this._objective(b, dt);
-      }
-      this._syncMesh(b, dt, Math.hypot(b.vel.x, b.vel.z));
-    }
-  }
-
-  _faceTarget(b, dt) {
-    if (!b.target) return;
-    const tx = b.target.pos ? b.target.pos.x : b.target.x;
-    const tz = b.target.pos ? b.target.pos.z : b.target.z;
-    const want = Math.atan2(-(tx - b.pos.x), -(tz - b.pos.z));
-    let d = want - b.yaw;
-    while (d > Math.PI) d -= Math.PI * 2;
-    while (d < -Math.PI) d += Math.PI * 2;
-    b.yaw += clamp(d, -dt * 7, dt * 7);
-  }
-
-  _engage(b, dt) {
-    const S = this.S;
-    const t = b.target;
-    const tx = t.pos ? t.pos.x : t.x;
-    const tz = t.pos ? t.pos.z : t.z;
-    const dist = Math.hypot(tx - b.pos.x, tz - b.pos.z);
-    this._faceTarget(b, dt);
-    // Strafe while fighting; close distance if far, hold if close.
-    b.strafeT -= dt;
-    if (b.strafeT <= 0) { b.strafeDir = S.rng() < 0.5 ? -1 : 1; b.strafeT = 0.5 + S.rng() * 0.6; }
-    const fx = -Math.sin(b.yaw), fz = -Math.cos(b.yaw);
-    let mx = 0, mz = 0;
-    if (dist > 14) { mx = fx; mz = fz; }
-    else if (dist < 5) { mx = -fx * 0.5; mz = -fz * 0.5; }
-    mx += -fz * b.strafeDir * 0.7; mz += fx * b.strafeDir * 0.7;
-    this._move(b, mx, mz, dt, BOT_SPEED * 0.55);
-    // Burst fire after the reaction delay.
-    b.reactT -= dt;
-    if (b.reactT > 0) return;
-    const w = currentWeapon(b.loadout);
-    if (!w) return;
-    b.burstPause -= dt;
-    if (b.burstLeft <= 0 && b.burstPause <= 0) {
-      b.burstLeft = 3 + ((S.rng() * 3) | 0);
-      b.burstPause = 0.55 + S.rng() * 0.55;
-    }
-    b.fireT -= dt;
-    if (b.burstLeft > 0 && b.fireT <= 0) {
-      b.fireT = w.interval * (1 + (1 - b.skill.accuracy) * 0.6);
-      const res = tryFire(b.loadout, w, null);
-      if (res === 'fired') {
-        b.burstLeft -= 1;
-        // Aim at chest, sometimes head, with skill-based error.
-        const head = S.rng() < 0.14;
-        const aimY = head ? 1.62 : 1.1;
-        const err = (1 - b.skill.accuracy) * 0.055 + dist * 0.0009 + (t.moveMag || 0) * 0.02;
-        const dx = tx - b.pos.x, dy = aimY - 1.55, dz = tz - b.pos.z;
-        const len = Math.hypot(dx, dy, dz) || 1;
-        const spread = currentSpread(w, 0.4, false, b.loadout.bloom, false) + err;
-        const origin = { x: b.pos.x, y: 1.55, z: b.pos.z };
-        const dir = { x: dx / len, y: dy / len, z: dz / len };
-        this.combat.fire(b, origin, dir, w, spread, S.rng, false);
-        this.render.muzzleFlashAt(origin);
-      } else if (res === 'dry') {
-        // Bot reloads on empty.
-        startReload(b.loadout, null);
+        const aimErr = (1 - brain.skill) * 0.05 + 0.008;
+        const dir = aimAt(bot, t, aimErr);
+        const res = fireShot(state, world, bot, dir.x, dir.y, dir.z, input.ads);
+        brain.burstLeft -= 1;
+        if (gun.mag === 0) { bot.weapons[bot.slot].reloading = gun.def.reload; }
+        if (res === 'kill') radio(state, bot, 'Got one — ' + t.name + ' down.');
       }
     }
-  }
-
-  _objective(b, dt) {
-    const S = this.S;
-    const layout = this.world.layout;
-    // Bomb planted: attackers defend the site, defenders retake.
-    if (S.bomb.planted) {
-      if (b.team === 'def') {
-        const site = layout.sites[S.bomb.site];
-        const d = Math.hypot(site.x - b.pos.x, site.z - b.pos.z);
-        if (d < 2.2) {
-          if (!b.channel) {
-            b.channel = { kind: 'defuse', t: 0, dur: S.defuseTime };
-            this.sfx.defuseBeep();
-          }
-          return;
+    // A bot that sees 2+ enemies grouped close may lob a frag at them.
+    if (!brain.threwGrenade && bot.grenades.frag > 0 && targetD < 20 && countNearbyEnemies(state, bot, 9) >= 2) {
+      throwGrenade(state, bot, 'frag');
+      brain.threwGrenade = true;
+      radio(state, bot, 'Frag out!');
+    }
+  } else {
+    // No target: follow the role's movement.
+    switch (brain.state) {
+      case 'route': case 'retake': case 'guard': {
+        followPath(state, bot, input, dt);
+        break;
+      }
+      case 'hold': {
+        // Sit on the hold, scan the lane: slow yaw sweep.
+        if (brain.holdPos) {
+          const n = state.map.nodes[brain.holdPos.node];
+          bot.yaw = angleLerp(bot.yaw, brain.holdPos.yaw + Math.sin(state.time * 0.5 + bot.id) * 0.5, dt * 2);
+          const dx = n.x - bot.pos.x, dz = n.z - bot.pos.z;
+          if (dx * dx + dz * dz > 1) { input.f = 1; bot.yaw = Math.atan2(-dx, -dz); }
+        } else {
+          bot.yaw += dt * 0.35; // no assigned hold: keep scanning
         }
-        this._followRoute(b, layout.routes[S.bomb.site === 'A' ? 'retakeA' : 'retakeB'], dt);
-        return;
+        input.crouch = Math.random() < 0.02;
+        break;
       }
-      // Attackers: hold near the planted site.
-      const site = layout.sites[S.bomb.site];
-      const d = Math.hypot(site.x - b.pos.x, site.z - b.pos.z);
-      if (d > 6) { this._steerTo(b, site.x, site.z, dt, BOT_SPEED * 0.8); return; }
-      this._holdScan(b, dt);
-      return;
-    }
-    if (b.team === 'atk') {
-      // Carrier plants when it reaches its site.
-      if (b.isCarrier) {
-        const site = layout.sites[S.planSite];
-        const d = Math.hypot(site.x - b.pos.x, site.z - b.pos.z);
-        if (d < site.r * 0.7) {
-          if (!b.channel) {
-            b.channel = { kind: 'plant', t: 0, dur: S.plantTime };
-            this.sfx.plantStart();
-          }
-          return;
+      case 'plant': {
+        const res = tryPlant(state, bot, dt);
+        if (res === 'planted') { brain.state = 'guard'; radio(state, bot, 'Spike planted — hold the site!'); }
+        else if (res === false) { brain.state = 'route'; brain.path = planRoute(state, bot, siteNode(state, brain.site)); brain.node = 0; }
+        break;
+      }
+      case 'defuse': {
+        const res = tryDefuse(state, bot, dt);
+        if (res === 'defused') brain.state = 'hold';
+        else if (res === false) { brain.state = 'retake'; }
+        break;
+      }
+      case 'investigate': {
+        if (brain.investigate) {
+          const dx = brain.investigate.x - bot.pos.x, dz = brain.investigate.z - bot.pos.z;
+          if (dx * dx + dz * dz < 2.5) { brain.investigate = null; brain.state = bot.team === 'B' ? 'hold' : 'route'; }
+          else { input.f = 1; bot.yaw = angleLerp(bot.yaw, Math.atan2(-dx, -dz), dt * 4); }
         }
+        break;
       }
-      this._followRoute(b, b.route, dt);
-      return;
+      default: followPath(state, bot, input, dt);
     }
-    // Defenders: walk to hold, then scan.
-    if (b.holdNode !== null) { this._holdScan(b, dt); return; }
-    this._followRoute(b, b.route, dt);
-  }
-
-  _holdScan(b, dt) {
-    // Slowly sweep the view; move to investigate lastSeen if fresh.
-    const S = this.S;
-    if (b.lastSeen && S.time - b.lastSeen.t < 6 && b.team === 'def') {
-      const d = Math.hypot(b.lastSeen.x - b.pos.x, b.lastSeen.z - b.pos.z);
-      if (d > 4) { this._steerTo(b, b.lastSeen.x, b.lastSeen.z, dt, BOT_SPEED * 0.7); return; }
+    // Smoke the site entrance when a teammate is about to plant.
+    if (bot.team === 'A' && bot.grenades.smoke > 0 && !brain.threwGrenade) {
+      const planter = state.actors.find(a => a.team === 'A' && a.hasSpike && a !== bot);
+      if (planter && siteOf(state, planter)) {
+        const site = state.map.sites[siteOf(state, planter)];
+        const d = Math.sqrt(dist2(bot.pos.x, bot.pos.z, site.x, site.z));
+        if (d < 16) { throwGrenade(state, bot, 'smoke'); brain.threwGrenade = true; radio(state, bot, 'Smoking ' + siteOf(state, planter) + ' — plant now!'); }
+      }
     }
-    b.yaw += dt * 0.35 * Math.sin(S.time * 0.5 + b.id);
-    this._move(b, 0, 0, dt, 0);
   }
-
-  _followRoute(b, route, dt) {
-    if (!route || route.length === 0) { this._holdScan(b, dt); return; }
-    if (b.routeIdx >= route.length) {
-      // End of route: hold here and scan.
-      b.holdNode = route[route.length - 1];
-      this._holdScan(b, dt);
-      return;
+  // Retake arrival: start defusing when on the planted site.
+  if (brain.state === 'retake' && bomb.state === 'planted' && dist2(bot.pos.x, bot.pos.z, bomb.x, bomb.z) < 2.2 * 2.2) {
+    brain.state = 'defuse';
+  }
+  moveActor(bot, input, dt, world.colliders);
+  // Stuck detection: if the bot barely moved for 2 s, re-path around the block.
+  const moved = Math.hypot(bot.pos.x - (brain.stuckPos?.x ?? bot.pos.x), bot.pos.z - (brain.stuckPos?.z ?? bot.pos.z));
+  if (state.time - brain.stuckAt > 2) {
+    if (moved < 0.6 && (brain.state === 'route' || brain.state === 'retake' || brain.state === 'guard')) {
+      const goal = brain.path[brain.path.length - 1] ?? nearestNode(state.map, bot.pos.x, bot.pos.z);
+      brain.path = findPath(state.map, nearestNode(state.map, bot.pos.x, bot.pos.z), goal);
+      brain.node = 0;
     }
-    const node = route[b.routeIdx];
-    this.world.nodePos(node, _v);
-    const d = Math.hypot(_v.x - b.pos.x, _v.z - b.pos.z);
-    if (d < 1.4) { b.routeIdx += 1; return; }
-    this._steerTo(b, _v.x, _v.z, dt, BOT_SPEED);
-  }
-
-  _steerTo(b, x, z, dt, speed) {
-    const dx = x - b.pos.x, dz = z - b.pos.z;
-    const len = Math.hypot(dx, dz) || 1;
-    this._move(b, dx / len, dz / len, dt, speed);
-    const want = Math.atan2(-dx, -dz);
-    let d = want - b.yaw;
-    while (d > Math.PI) d -= Math.PI * 2;
-    while (d < -Math.PI) d += Math.PI * 2;
-    b.yaw += clamp(d, -dt * 6, dt * 6);
-  }
-
-  _move(b, mx, mz, dt, speed) {
-    const len = Math.hypot(mx, mz);
-    if (len > 0.01) { mx /= len; mz /= len; }
-    const k = Math.min(1, dt * 8);
-    b.vel.x += (mx * speed - b.vel.x) * k;
-    b.vel.z += (mz * speed - b.vel.z) * k;
-    b.pos.x += b.vel.x * dt;
-    b.pos.z += b.vel.z * dt;
-    this.world.collideCircle(b.pos, 0.38);
-  }
-
-  _syncMesh(b, dt, speed) {
-    const m = b.mesh;
-    m.position.set(b.pos.x, 0, b.pos.z);
-    m.rotation.y = b.yaw;
-    this.render.animateBot(m, speed, dt, !!b.channel);
+    brain.stuckAt = state.time; brain.stuckPos = { x: bot.pos.x, z: bot.pos.z };
   }
 }
 
-// Bots keep their meshes across rounds; spawnRound only re-places them.
+function followPath(state, bot, input, dt) {
+  const brain = bot.bot;
+  if (!brain.path || brain.node >= brain.path.length) {
+    if (brain.state === 'route') { brain.state = bot.team === 'A' ? 'hold' : 'hold'; }
+    return;
+  }
+  const n = state.map.nodes[brain.path[brain.node]];
+  const dx = n.x - bot.pos.x, dz = n.z - bot.pos.z;
+  const d = Math.hypot(dx, dz);
+  if (d < 0.9) { brain.node += 1; return; }
+  const wantYaw = Math.atan2(-dx, -dz);
+  bot.yaw = angleLerp(bot.yaw, wantYaw, clamp(dt * 5, 0, 1));
+  input.f = 1;
+  // Crouch-walk the last stretch into a site: quieter, harder to spot.
+  const site = state.map.sites[brain.site] || state.map.sites.A;
+  if (bot.team === 'A' && dist2(bot.pos.x, bot.pos.z, site.x, site.z) < 100) input.crouch = true;
+}
+
+// Aim at a target with skill-based error, preferring the head at close range.
+function aimAt(bot, target, err) {
+  const headY = 1.55, bodyY = 0.95;
+  const aimHead = Math.random() < 0.22 + bot.bot.skill * 0.25;
+  const ty = aimHead ? headY : bodyY;
+  const dx = target.pos.x - bot.pos.x, dy = ty - eyeHeight(bot), dz = target.pos.z - bot.pos.z;
+  const d = Math.hypot(dx, dy, dz) || 1;
+  return {
+    x: dx / d + (Math.random() - 0.5) * 2 * err,
+    y: dy / d + (Math.random() - 0.5) * 2 * err,
+    z: dz / d + (Math.random() - 0.5) * 2 * err,
+  };
+}
+
+function countNearbyEnemies(state, bot, radius) {
+  let n = 0;
+  for (const a of state.actors) {
+    if (a.team !== bot.team && a.alive && dist2(a.pos.x, a.pos.z, bot.pos.x, bot.pos.z) < radius * radius) n++;
+  }
+  return n;
+}
+
+function radio(state, bot, text) {
+  if (state.time - bot.bot.radioAt < 4) return;
+  bot.bot.radioAt = state.time;
+  state.radio.push({ team: bot.team, name: bot.name, text, t: state.time });
+  if (state.radio.length > 5) state.radio.shift();
+}
+
+export { BOT_NAMES_A, BOT_NAMES_B };

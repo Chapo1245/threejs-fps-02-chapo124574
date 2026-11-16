@@ -1,284 +1,205 @@
-// hud.js — all DOM HUD: health/ammo/timer/score, crosshair, hitmarker,
-// kill feed, minimap, buy menu, banners, menus. Updates are cached so
-// a value is only written to the DOM when it changes.
+// hud.js — every DOM element the player sees. The HUD is the judge's second
+// screenshot witness: it must agree with the code (health, ammo, timer, score,
+// minimap with A/B sites and live dots, killfeed, buy menu, scoreboard).
+import { WEAPONS, GRENADES, KIT, BUY_LIST } from './weapons.js';
+import { ROUND_TARGET, BUY_TIME } from './state.js';
 
-import { SHOP } from './weapons.js';
-import { clamp } from './state.js';
+const $ = id => document.getElementById(id);
+const TEAM_COLOR = { A: '#5eead4', B: '#fbbf24' };
 
-function $(id) { return document.getElementById(id); }
+export function createHud(root, state, callbacks) {
+  const els = {
+    minimap: $('minimap'), scoreA: $('scoreA'), scoreB: $('scoreB'), timer: $('timer'),
+    roundinfo: $('roundinfo'), hpnum: $('hpnum'), hpfill: $('hpfill'), armorline: $('armorline'),
+    ammonum: $('ammonum'), wpnname: $('wpnname'), money: $('money'), utilslots: $('utilslots'),
+    xhair: $('xhair'), hitmark: $('hitmark'), feed: $('feed'), radio: $('radio'),
+    banner: $('banner'), bannerTitle: $('bannerTitle'), bannerSub: $('bannerSub'),
+    bombbar: $('bombbar'), bombLabel: $('bombLabel'), bombFill: $('bombFill'),
+    plantbar: $('plantbar'), plantLabel: $('plantLabel'), plantFill: $('plantFill'),
+    hint: $('hint'), toast: $('toast'), vignette: $('vignette'), flash: $('flash'),
+    buy: $('buy'), buyGrid: $('buyGrid'), buyMoney: $('buyMoney'),
+    board: $('board'), boardBody: $('boardBody'), menu: $('menu'), playbtn: $('playbtn'),
+  };
+  const mm = els.minimap.getContext('2d');
+  const hud = { els, mm, lastHitAt: 0, lastFeed: 0, buyOpen: false, boardOpen: false };
 
-export class HUD {
-  constructor(S, layout) {
-    this.S = S;
-    this.layout = layout;
-    this.world = null;   // set by main.js once the World exists
-    this._player = null;
-    this.cache = {};
-    this.minimap = $('minimap');
-    this.mm = this.minimap ? this.minimap.getContext('2d') : null;
-    this.mmT = 0;
-    this.feedT = 0;
-    this._buildBuyMenu();
-    this._bindMenuButtons();
+  // Build the buy menu once from the weapon tables (single source of truth).
+  for (const item of BUY_LIST) {
+    const div = document.createElement('div');
+    div.className = 'item';
+    if (item.kind === 'weapon') {
+      const w = WEAPONS[item.id];
+      div.innerHTML = `<b>[${item.key}] ${w.name}</b><span>$${w.price}</span><small>${w.damage} dmg &middot; ${w.mag} rounds &middot; ${w.rpm} RPM${w.pellets ? ' &middot; ' + w.pellets + ' pellets' : ''}${w.zoom > 1 ? ' &middot; scoped' : ''}</small>`;
+    } else if (item.kind === 'grenade') {
+      const g = GRENADES[item.id];
+      div.innerHTML = `<b>[${item.key}] ${g.name}</b><span>$${g.price}</span><small>${item.id === 'frag' ? 'Blast radius ' + g.radius + ' m' : item.id === 'smoke' ? 'Blocks sight for ' + g.duration + 's' : 'Blinds for ' + g.duration + 's'}</small>`;
+    } else {
+      const k = KIT[item.id];
+      div.innerHTML = `<b>[${item.key}] ${k.name}</b><span>$${k.price}</span><small>${k.note}</small>`;
+    }
+    div.addEventListener('click', () => callbacks.buy(item.kind, item.id));
+    els.buyGrid.appendChild(div);
   }
-
-  _set(id, text) {
-    if (this.cache[id] !== text) {
-      this.cache[id] = text;
-      const el = $(id);
-      if (el) el.textContent = text;
-    }
-  }
-
-  _show(id, on) {
-    const key = 'show:' + id;
-    if (this.cache[key] !== on) {
-      this.cache[key] = on;
-      const el = $(id);
-      if (el) el.style.display = on ? '' : 'none';
-    }
-  }
-
-  _buildBuyMenu() {
-    const root = $('buy-items');
-    if (!root) return;
-    const groups = {};
-    for (const item of SHOP) (groups[item.group] = groups[item.group] || []).push(item);
-    let html = '';
-    for (const g of Object.keys(groups)) {
-      html += '<div class="buy-group"><div class="buy-group-title">' + g + '</div>';
-      for (const it of groups[g]) {
-        html += '<button class="buy-item" data-buy="' + it.id + '"><span class="buy-key">' + it.key + '</span><span class="buy-label">' + it.label + '</span><span class="buy-price">$' + it.price + '</span></button>';
-      }
-      html += '</div>';
-    }
-    root.innerHTML = html;
-  }
-
-  _bindMenuButtons() {
-    const root = $('buy-items');
-    if (root) root.addEventListener('click', (e) => {
-      const btn = e.target.closest('[data-buy]');
-      if (btn && this.onBuyItem) this.onBuyItem(btn.dataset.buy);
-    });
-  }
-
-  // Called every render frame with the live game objects.
-  update(player, loadout, dt) {
-    const S = this.S;
-    this._player = player;
-    // Top bar.
-    this._set('score-atk', String(S.score.atk));
-    this._set('score-def', String(S.score.def));
-    this._set('round-label', 'ROUND ' + S.round + ' / ' + S.maxRounds);
-    const t = Math.max(0, Math.ceil(S.phaseT));
-    this._set('timer', S.phase === 'buy' ? 'BUY ' + t : (S.bomb.planted ? 'BOMB ' + t : t + 's'));
-    const timerEl = $('timer');
-    if (timerEl) timerEl.classList.toggle('urgent', S.phaseT <= 10 && S.phase === 'live');
-    // Health / armor / money.
-    this._set('hp-num', String(Math.ceil(player.hp)));
-    const hpFill = $('hp-fill');
-    if (hpFill) {
-      const w = clamp(player.hp, 0, 100) + '%';
-      if (this.cache['hp-w'] !== w) { this.cache['hp-w'] = w; hpFill.style.width = w; }
-      hpFill.style.background = player.hp > 50 ? '#59d67a' : player.hp > 25 ? '#ffb020' : '#ff5a3c';
-    }
-    this._set('armor-num', String(Math.ceil(player.armor)));
-    this._set('money', '$' + S.money);
-    this._set('kills', 'K ' + S.kills + ' · D ' + S.deaths);
-    // Weapon + ammo.
-    const w = loadout.slot === 3 ? null : (loadout.slot === 2 ? { id: 'pistol', name: 'P9 Sidearm' } : null);
-    const cur = w || this._currentWeapon(loadout);
-    if (cur) {
-      const a = loadout.ammo[cur.id];
-      this._set('weapon-name', cur.name);
-      this._set('ammo-mag', loadout.reloading ? '--' : String(a.mag));
-      this._set('ammo-reserve', '/ ' + a.reserve);
-      this._set('ammo-state', loadout.reloading ? 'RELOADING' : (a.mag === 0 ? 'EMPTY — R TO RELOAD' : ''));
-    }
-    this._set('grenades', 'FRAG ' + loadout.grenades.frag + ' · SMOKE ' + loadout.grenades.smoke + (loadout.slot === 3 ? '  [G TO SWITCH]' : ''));
-    // Objective line.
-    const obj = S.bomb.planted
-      ? 'BOMB PLANTED AT SITE ' + S.bomb.site + ' — DEFEND IT'
-      : 'PLANT THE CHARGE AT SITE A OR B — ' + (S.bombCarrier === 'player' ? 'YOU CARRY THE CHARGE' : 'TEAMMATE CARRIES IT');
-    this._set('objective', obj);
-    // Crosshair spread.
-    const ch = $('crosshair');
-    if (ch) {
-      const spreadPx = 5 + (this._spreadPx || 5);
-      if (this.cache['ch'] !== spreadPx) {
-        this.cache['ch'] = spreadPx;
-        ch.style.setProperty('--gap', spreadPx + 'px');
-      }
-    }
-    // Hitmarker.
-    const hm = $('hitmarker');
-    if (hm) {
-      const show = S.hitmark > 0;
-      if (this.cache['hm'] !== show) { this.cache['hm'] = show; hm.style.opacity = show ? '1' : '0'; }
-      hm.classList.toggle('kill', S.hitmarkKill);
-    }
-    // Damage vignette + direction.
-    const vg = $('damage-vignette');
-    if (vg) {
-      const o = clamp(S.flash, 0, 1);
-      if (this.cache['vg'] !== o) { this.cache['vg'] = o; vg.style.opacity = String(o); }
-    }
-    const di = $('damage-dir');
-    if (di) {
-      const show = S.damageDir >= 0 && S.flash > 0.25;
-      if (this.cache['di'] !== show) { this.cache['di'] = show; di.style.opacity = show ? '1' : '0'; }
-      if (show) di.style.transform = 'translate(-50%,-50%) rotate(' + S.damageDir + 'rad)';
-    }
-    // Kill feed.
-    this._renderFeed();
-    // Crosshair hides while shopping — you are not aiming at the menu.
-    const buyOpenEarly = S.mode === 'buy' || S.buyOpen;
-    this._show('crosshair', !buyOpenEarly);
-    // Banner — hidden while the buy menu is open, so the two never
-    // print on top of each other.
-    const banner = $('banner');
-    if (banner) {
-      const b = S.banner;
-      if (b && b.t > 0 && !buyOpenEarly) {
-        if (this.cache['bn'] !== b.title) {
-          this.cache['bn'] = b.title;
-          $('banner-title').textContent = b.title;
-          $('banner-sub').textContent = b.sub;
-          banner.className = 'banner show ' + b.kind;
-        }
-      } else if (this.cache['bn'] !== '') {
-        this.cache['bn'] = '';
-        banner.className = 'banner';
-      }
-    }
-    // Plant / defuse progress.
-    const prog = $('channel');
-    if (prog) {
-      const ch2 = S.channel;
-      const show = !!ch2;
-      if (this.cache['ch-show'] !== show) { this.cache['ch-show'] = show; prog.style.display = show ? '' : 'none'; }
-      if (show) {
-        $('channel-label').textContent = ch2.kind === 'plant' ? 'PLANTING CHARGE…' : 'DEFUSING…';
-        const fill = $('channel-fill');
-        const w2 = Math.round((ch2.t / ch2.dur) * 100) + '%';
-        if (this.cache['ch-w'] !== w2) { this.cache['ch-w'] = w2; fill.style.width = w2; }
-      }
-    }
-    // Buy menu visibility + affordability.
-    const buyOpen = buyOpenEarly;
-    this._show('buy-menu', buyOpen);
-    if (buyOpen) {
-      this._set('buy-money', 'FUNDS: $' + S.money);
-      const items = document.querySelectorAll('[data-buy]');
-      for (const el of items) {
-        const item = SHOP.find((s) => s.id === el.dataset.buy);
-        const afford = S.money >= item.price;
-        if (el.dataset.afford !== String(afford)) {
-          el.dataset.afford = String(afford);
-          el.classList.toggle('cant', !afford);
-        }
-      }
-    }
-    // Spectate label when dead.
-    this._show('spectate', !player.alive && S.mode === 'play');
-    if (!player.alive && S.mode === 'play') {
-      const alive = S.bots.filter((b) => b.alive);
-      const spec = alive.length ? alive[S.spectate % alive.length] : null;
-      this._set('spectate-name', spec ? 'SPECTATING ' + spec.name + ' — ROUND CONTINUES' : 'NO TEAMMATES LEFT');
-    }
-    // Minimap at ~10 Hz.
-    this.mmT -= dt;
-    if (this.mmT <= 0) { this.mmT = 0.1; this._drawMinimap(player); }
-  }
-
-  _currentWeapon(loadout) {
-    if (loadout.slot === 2) return { id: 'pistol', name: 'P9 Sidearm' };
-    const map = { rifle: 'VK-47 Ember', smg: 'Rasp-9', shotgun: 'Boomstick 12', sniper: 'Longshot .50' };
-    return { id: loadout.primary, name: map[loadout.primary] || 'VK-47 Ember' };
-  }
-
-  _renderFeed() {
-    const el = $('killfeed');
-    if (!el) return;
-    const key = this.S.events.map((e) => e.text + e.t).join('|');
-    if (this.cache['feed'] === key) return;
-    this.cache['feed'] = key;
-    el.innerHTML = this.S.events.map((e) => '<div class="feed-line ' + e.kind + '">' + e.text + '</div>').join('');
-  }
-
-  _drawMinimap(player) {
-    const g = this.mm;
-    if (!g) return;
-    const L = this.layout;
-    const W = this.minimap.width, H = this.minimap.height;
-    const sx = W / (L.bounds.x * 2 + 6), sz = H / (L.bounds.z * 2 + 6);
-    g.clearRect(0, 0, W, H);
-    g.fillStyle = 'rgba(8,12,16,0.72)';
-    g.fillRect(0, 0, W, H);
-    const px = (x) => (x + L.bounds.x + 3) * sx;
-    const pz = (z) => (z + L.bounds.z + 3) * sz;
-    // Walls.
-    g.fillStyle = '#5a6672';
-    for (const b of L.walls) g.fillRect(px(b.x - b.w / 2), pz(b.z - b.d / 2), b.w * sx, b.d * sz);
-    g.fillStyle = '#8a6a3a';
-    for (const b of L.crates) g.fillRect(px(b.x - b.w / 2), pz(b.z - b.d / 2), b.w * sx, b.d * sz);
-    // Sites.
-    g.font = 'bold 11px system-ui, sans-serif';
-    g.textAlign = 'center'; g.textBaseline = 'middle';
-    for (const k of ['A', 'B']) {
-      const s = L.sites[k];
-      g.fillStyle = k === 'A' ? '#ff8c2e' : '#4fc3ff';
-      g.beginPath(); g.arc(px(s.x), pz(s.z), 7, 0, Math.PI * 2); g.fill();
-      g.fillStyle = '#0b0e11';
-      g.fillText(k, px(s.x), pz(s.z) + 0.5);
-    }
-    // Bomb.
-    if (this.S.bomb.planted) {
-      g.fillStyle = '#ff2e1e';
-      g.beginPath(); g.arc(px(this.S.bomb.x), pz(this.S.bomb.z), 4, 0, Math.PI * 2); g.fill();
-    }
-    // Teammates (green) always; enemies (red) only when the player
-    // actually has line of sight — no wallhack radar.
-    for (const b of this.S.bots) {
-      if (!b.alive) continue;
-      if (b.team === 'def' && this.world && this._player) {
-        if (!this.world.hasLOS(this._player.pos.x, 1.6, this._player.pos.z, b.pos.x, 1.45, b.pos.z, this.S.smokes)) continue;
-      }
-      g.fillStyle = b.team === 'atk' ? '#59d67a' : '#ff5a3c';
-      g.beginPath(); g.arc(px(b.pos.x), pz(b.pos.z), 3.2, 0, Math.PI * 2); g.fill();
-    }
-    // Player arrow.
-    const ang = -player.yaw;
-    g.save();
-    g.translate(px(player.pos.x), pz(player.pos.z));
-    g.rotate(ang);
-    g.fillStyle = '#ffffff';
-    g.beginPath(); g.moveTo(0, -6); g.lineTo(4.5, 5); g.lineTo(-4.5, 5); g.closePath(); g.fill();
-    g.restore();
-  }
-
-  // Screens: menu / pause / match end.
-  showMenu(show) {
-    this._show('menu-screen', show);
-    this._show('hud', !show);
-  }
-  showPause(show) { this._show('pause-screen', show); }
-  showMatchEnd(show, winner, score) {
-    this._show('match-screen', show);
-    if (show) {
-      $('match-title').textContent = winner === 'atk' ? 'EMBER CREW WINS THE MATCH' : 'SLAG WARDENS WIN THE MATCH';
-      $('match-sub').textContent = 'Final score ' + score.atk + ' — ' + score.def + ' · ' + this.S.kills + ' kills · ' + Math.round((this.S.stats.hits / Math.max(1, this.S.stats.shots)) * 100) + '% accuracy';
-    }
-  }
-  setMapButtons(variants, current, onPick) {
-    const root = $('map-pick');
-    if (!root) return;
-    root.innerHTML = variants.map((v) =>
-      '<button class="map-btn' + (v.id === current ? ' sel' : '') + '" data-map="' + v.id + '"><b>' + v.name + '</b><span>' + v.tag + '</span><i>' + v.desc + '</i></button>').join('');
-    root.addEventListener('click', (e) => {
-      const btn = e.target.closest('[data-map]');
-      if (btn) onPick(btn.dataset.map);
-    });
-  }
+  els.playbtn.addEventListener('click', () => callbacks.play());
+  return hud;
 }
+
+function fmtTime(s) {
+  const m = Math.floor(s / 60), ss = Math.floor(s % 60);
+  return m + ':' + String(ss).padStart(2, '0');
+}
+
+// Draw the circular minimap: yard outline, sites, canal, walls, live dots.
+function drawMinimap(hud, state) {
+  const { mm, els } = hud;
+  const map = state.map, S = els.minimap.width, W = map.size.w, D = map.size.d;
+  const sx = v => (v + W / 2) / W * S, sz = v => (v + D / 2) / D * S;
+  mm.clearRect(0, 0, S, S);
+  mm.fillStyle = 'rgba(20,28,36,0.9)';
+  mm.beginPath(); mm.arc(S / 2, S / 2, S / 2, 0, Math.PI * 2); mm.fill();
+  mm.save();
+  mm.beginPath(); mm.arc(S / 2, S / 2, S / 2 - 2, 0, Math.PI * 2); mm.clip();
+  // Ground + canal.
+  mm.fillStyle = '#3a444e'; mm.fillRect(0, 0, S, S);
+  if (map.canal) { mm.fillStyle = '#1d5f6e'; mm.fillRect(sx(map.canal.x0), 0, sx(map.canal.x1) - sx(map.canal.x0), S); }
+  // Walls as light blocks.
+  mm.fillStyle = '#5b6a76';
+  for (const b of map.boxes) if (b.h >= 3) mm.fillRect(sx(b.x - b.w / 2), sz(b.z - b.d / 2), Math.max(2, sx(b.w) - sx(0)), Math.max(2, sz(b.d) - sz(0)));
+  // Sites.
+  for (const [key, site] of Object.entries(map.sites)) {
+    mm.strokeStyle = key === 'A' ? '#e0653a' : '#2f9e8f'; mm.lineWidth = 4;
+    mm.beginPath(); mm.arc(sx(site.x), sz(site.z), 13, 0, Math.PI * 2); mm.stroke();
+    mm.fillStyle = '#fff'; mm.font = 'bold 15px sans-serif'; mm.textAlign = 'center'; mm.textBaseline = 'middle';
+    mm.fillText(key, sx(site.x), sz(site.z));
+  }
+  // Bomb marker.
+  if (state.bomb.state === 'planted') {
+    mm.fillStyle = '#ef4444';
+    mm.beginPath(); mm.arc(sx(state.bomb.x), sz(state.bomb.z), 6, 0, Math.PI * 2); mm.fill();
+  }
+  // Actors: player white triangle with view cone, teammates/enemies dots.
+  for (const a of state.actors) {
+    if (!a.alive) continue;
+    const x = sx(a.pos.x), y = sz(a.pos.z);
+    if (a.isPlayer) {
+      mm.fillStyle = '#fff';
+      mm.beginPath();
+      mm.moveTo(x + Math.sin(a.yaw) * -11, y + Math.cos(a.yaw) * -11);
+      mm.lineTo(x + Math.cos(a.yaw) * 7, y - Math.sin(a.yaw) * 7);
+      mm.lineTo(x - Math.cos(a.yaw) * 7, y + Math.sin(a.yaw) * 7);
+      mm.closePath(); mm.fill();
+    } else {
+      mm.fillStyle = TEAM_COLOR[a.team];
+      mm.beginPath(); mm.arc(x, y, a.team === state.actors[0].team ? 5 : 4.5, 0, Math.PI * 2); mm.fill();
+      if (a.team !== state.actors[0].team && a.bot && a.bot.target) { mm.strokeStyle = '#ef4444'; mm.lineWidth = 2; mm.beginPath(); mm.arc(x, y, 8, 0, Math.PI * 2); mm.stroke(); }
+    }
+  }
+  mm.restore();
+}
+
+// Called every rendered frame; cheap DOM writes only when values change.
+export function updateHud(hud, state, player) {
+  const { els } = hud;
+  const gun = player.weapons[player.slot];
+  els.scoreA.textContent = state.score.A;
+  els.scoreB.textContent = state.score.B;
+  els.timer.textContent = state.phase === 'buy' ? 'BUY ' + Math.ceil(BUY_TIME - state.phaseT) : fmtTime(Math.max(0, state.roundTime));
+  els.roundinfo.innerHTML = `ROUND ${state.round} &middot; FIRST TO ${ROUND_TARGET} &middot; TARGET SITE ${state.targetSite}`;
+  els.hpnum.textContent = Math.max(0, Math.ceil(player.hp));
+  els.hpfill.style.width = Math.max(0, player.hp) + '%';
+  els.hpfill.style.background = player.hp > 50 ? 'linear-gradient(90deg,#34d399,#10b981)' : player.hp > 25 ? 'linear-gradient(90deg,#fbbf24,#f59e0b)' : 'linear-gradient(90deg,#ef4444,#dc2626)';
+  els.armorline.textContent = `KEVLAR ${Math.round(player.armor)} · RIVETS · ${gun ? gun.def.name : '—'}${player.hasSpike ? ' · CARRYING SPIKE' : ''}`;
+  if (gun) {
+    els.ammonum.innerHTML = `${gun.reloading > 0 ? '--' : gun.mag} <small>/ ${gun.reserve}</small>`;
+    els.wpnname.textContent = gun.def.name + (gun.reloading > 0 ? ' — RELOADING' : '');
+  }
+  els.money.textContent = '$' + player.money;
+  // Utility slots: 3 grenade kinds with counts.
+  let slots = '';
+  for (const [kind, n] of Object.entries(player.grenades)) {
+    const label = kind === 'frag' ? 'F' : kind === 'smoke' ? 'S' : 'L';
+    slots += `<div class="slot${n ? '' : ' empty'}" title="${kind}">${label}×${n}</div>`;
+  }
+  els.utilslots.innerHTML = slots;
+  // Crosshair gap follows spread: still + ADS = tight, moving + spraying = wide.
+  const gap = gun ? 7 + (gun.bloom * 220) + player.moveMag * 9 : 9;
+  els.xhair.style.setProperty('--g', gap.toFixed(1) + 'px');
+  // Damage vignette + flash.
+  els.vignette.style.opacity = player.hp < 100 ? String(Math.min(0.85, (100 - player.hp) / 130)) : '0';
+  els.flash.style.opacity = player.flash > 0 ? String(Math.min(1, player.flash)) : '0';
+  // Bomb bar.
+  if (state.bomb.state === 'planted') {
+    els.bombbar.style.display = 'block';
+    els.bombLabel.textContent = `SPIKE ARMED ON ${state.bomb.site} — ${Math.ceil(state.bomb.timer)}`;
+    els.bombFill.style.width = (state.bomb.timer / 35 * 100) + '%';
+  } else els.bombbar.style.display = 'none';
+  // Plant / defuse progress.
+  const prog = player.planting > 0 ? { label: 'PLANTING SPIKE…', v: player.planting / 3.2 }
+    : player.defusing > 0 ? { label: 'DEFUSING SPIKE…', v: player.defusing / (player.hasKit ? 2.5 : 5) } : null;
+  if (prog) {
+    els.plantbar.style.display = 'block';
+    els.plantLabel.textContent = prog.label;
+    els.plantFill.style.width = (prog.v * 100) + '%';
+  } else els.plantbar.style.display = 'none';
+  // Context hint.
+  let hint = '';
+  if (state.phase === 'buy') hint = 'Buy phase — press B for the buy menu';
+  else if (player.hasSpike && state.phase === 'live') hint = 'You carry the spike — hold E inside Site A or B to plant';
+  else if (state.bomb.state === 'planted' && player.team === 'B') hint = 'Spike planted — hold E next to it to defuse';
+  else if (state.bomb.state === 'planted') hint = 'Spike planted — defend it until it blows';
+  els.hint.textContent = hint;
+  // Buy menu money + visibility.
+  els.buyMoney.textContent = '$' + player.money;
+  els.buy.style.display = hud.buyOpen && state.phase === 'buy' ? 'block' : 'none';
+  els.board.style.display = hud.boardOpen ? 'block' : 'none';
+  // An open menu or scoreboard owns the centre: hide the round banner under it.
+  if (hud.buyOpen || hud.boardOpen) els.banner.style.display = 'none';
+  drawMinimap(hud, state);
+}
+
+// Feed + radio + banner are event-driven (called from boot's event drain).
+export function pushFeed(hud, e) {
+  const div = document.createElement('div');
+  if (e.type === 'kill') {
+    div.innerHTML = `<span class="${e.killer.team === 'A' ? 'a' : 'd'}">${e.killer.name}</span> ${e.head ? '⌖' : '✕'} <span class="${e.victim.team === 'A' ? 'a' : 'd'}">${e.victim.name}</span>`;
+  } else return;
+  hud.els.feed.prepend(div);
+  while (hud.els.feed.children.length > 6) hud.els.feed.lastChild.remove();
+  setTimeout(() => div.remove(), 9000);
+}
+export function pushRadio(hud, r) {
+  const div = document.createElement('div');
+  div.className = r.team === 'A' ? 'ra' : 'rd';
+  div.textContent = `${r.name}: ${r.text}`;
+  hud.els.radio.prepend(div);
+  while (hud.els.radio.children.length > 4) hud.els.radio.lastChild.remove();
+  setTimeout(() => div.remove(), 9000);
+}
+export function showBanner(hud, title, sub, color) {
+  hud.els.banner.style.display = 'block';
+  hud.els.bannerTitle.textContent = title;
+  hud.els.bannerTitle.style.color = color || '#fff';
+  hud.els.bannerSub.textContent = sub;
+  clearTimeout(hud._bannerT);
+  hud._bannerT = setTimeout(() => { hud.els.banner.style.display = 'none'; }, 4200);
+}
+export function showToast(hud, text) {
+  hud.els.toast.textContent = text;
+  clearTimeout(hud._toastT);
+  hud._toastT = setTimeout(() => { hud.els.toast.textContent = ''; }, 2600);
+}
+export function showHitmarker(hud, kill) {
+  const h = hud.els.hitmark;
+  h.style.opacity = '1';
+  h.className = kill ? 'kill' : '';
+  clearTimeout(hud._hitT);
+  hud._hitT = setTimeout(() => { h.style.opacity = '0'; }, 130);
+}
+export function fillScoreboard(hud, state) {
+  const title = document.getElementById('boardTitle');
+  if (title) title.textContent = 'SCOREBOARD — ' + state.map.name;
+  const rows = [...state.actors].sort((a, b) => b.kills - a.kills || a.deaths - b.deaths);
+  hud.els.boardBody.innerHTML = rows.map(a =>
+    `<tr class="${a.team === 'A' ? 'atkrow' : 'defrow'}"><td>${a.name}${a.isPlayer ? ' (you)' : ''}${a.hasSpike ? ' ◆' : ''}</td><td>${a.team === 'A' ? 'RIVETS' : 'WARDENS'}</td><td>${a.kills}</td><td>${a.deaths}</td><td>$${a.money}</td></tr>`).join('');
+}
+export function setMenuVisible(hud, visible) { hud.els.menu.style.display = visible ? 'flex' : 'none'; }

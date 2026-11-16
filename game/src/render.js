@@ -1,253 +1,267 @@
-// render.js — three.js renderer, camera, lights hookup, bot meshes,
-// first-person viewmodel gun, and the two pooled effect systems
-// (tracers + impact particles). Pooled: zero allocations per shot.
-// Perf: pixel ratio capped (1.75 desktop, 1.0 touch), one 1024px
-// shadow map, instanced statics (see world.js), ~120 draw calls total.
-
+// render.js — turns state into pixels, and nothing else. No game logic here:
+// every frame it syncs meshes from state (actors, tracers, particles, smoke,
+// the spike) and positions the camera at the player's eye with recoil + bob.
+// Pooled tracers/particles: zero per-frame allocation in the hot loop.
 import * as THREE from 'three';
-import { clamp } from './state.js';
+import { eyeHeight } from './actors.js';
 
-const TRACER_MAX = 10;
-const PARTICLE_MAX = 160;
+const MAX_TRACERS = 10;
+const MAX_PARTICLES = 160;
+const MAX_SMOKE = 8;
 
-export class Render {
-  constructor(canvas, quality, isTouch) {
-    this.canvas = canvas;
-    this.quality = quality;
-    this.isTouch = isTouch;
-    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
-    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.12;
-    this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    this.applyQuality(quality);
-    this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(78, 1, 0.08, 220);
-    this.camera.rotation.order = 'YXZ';
-    this.muzzleLight = new THREE.PointLight(0xffc27d, 0, 9, 1.8);
-    this.scene.add(this.muzzleLight);
-    this._initTracers();
-    this._initParticles();
-    this._buildViewmodel();
-    this.flashT = 0;
+function makeHumanoid(teamColor) {
+  const g = new THREE.Group();
+  const suit = new THREE.MeshStandardMaterial({ color: 0x3a4148, roughness: 0.9 });
+  const vest = new THREE.MeshStandardMaterial({ color: teamColor, roughness: 0.75 });
+  const skin = new THREE.MeshStandardMaterial({ color: 0xc9a06a, roughness: 0.85 });
+  const dark = new THREE.MeshStandardMaterial({ color: 0x22262c, roughness: 0.9 });
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.62, 0.3), vest);
+  torso.position.y = 1.05; torso.castShadow = true; g.add(torso);
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.3, 0.3), skin);
+  head.position.y = 1.52; head.castShadow = true; g.add(head);
+  const helmet = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.14, 0.34), dark);
+  helmet.position.y = 1.66; g.add(helmet);
+  const legL = new THREE.Mesh(new THREE.BoxGeometry(0.19, 0.72, 0.22), suit);
+  legL.position.set(-0.14, 0.36, 0); g.add(legL);
+  const legR = legL.clone(); legR.position.x = 0.14; g.add(legR);
+  const armL = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.55, 0.18), suit);
+  armL.position.set(-0.34, 1.08, 0.12); armL.rotation.x = -0.9; g.add(armL);
+  const armR = armL.clone(); armR.position.x = 0.34; g.add(armR);
+  const gun = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.14, 0.72), dark);
+  gun.position.set(0.2, 1.12, 0.42); g.add(gun);
+  g.userData = { legL, legR, armL, armR, head };
+  return g;
+}
+
+function makeViewmodel() {
+  const g = new THREE.Group();
+  const body = new THREE.MeshStandardMaterial({ color: 0x1d2126, roughness: 0.55, metalness: 0.35 });
+  const accent = new THREE.MeshStandardMaterial({ color: 0x2f7f7a, roughness: 0.5, metalness: 0.4 });
+  const wood = new THREE.MeshStandardMaterial({ color: 0x6e5436, roughness: 0.85 });
+  const receiver = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.13, 0.62), body);
+  g.add(receiver);
+  const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.34, 8), body);
+  barrel.rotation.x = Math.PI / 2; barrel.position.set(0, 0.02, -0.46); g.add(barrel);
+  const mag = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.2, 0.12), accent);
+  mag.position.set(0, -0.14, -0.05); mag.rotation.x = 0.25; g.add(mag);
+  const stock = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.11, 0.22), wood);
+  stock.position.set(0, 0, 0.4); g.add(stock);
+  const sight = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.07, 0.1), accent);
+  sight.position.set(0, 0.1, -0.1); g.add(sight);
+  return g;
+}
+
+export function createRenderer(appEl, state) {
+  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  const dpr = Math.min(window.devicePixelRatio || 1, window.matchMedia('(pointer: coarse)').matches ? 1 : 1.75);
+  renderer.setPixelRatio(dpr);
+  renderer.setSize(appEl.clientWidth, appEl.clientHeight);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.05;
+  renderer.domElement.className = 'webgl';
+  appEl.prepend(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(74, appEl.clientWidth / appEl.clientHeight, 0.08, 220);
+  scene.add(camera); // camera-attached viewmodel + flash light need the camera in the scene
+
+  const viewmodel = makeViewmodel();
+  viewmodel.scale.setScalar(0.8);
+  viewmodel.position.set(0.24, -0.26, -0.5);
+  camera.add(viewmodel);
+  const muzzle = new THREE.PointLight(0xffc266, 0, 9, 1.8);
+  muzzle.position.set(0.26, -0.18, -0.9);
+  camera.add(muzzle);
+
+  // Actor meshes, keyed by actor id.
+  const actorMeshes = new Map();
+  for (const a of state.actors) {
+    const mesh = makeHumanoid(a.team === 'A' ? 0x14b8a6 : 0xd97706);
+    mesh.visible = false;
+    scene.add(mesh);
+    actorMeshes.set(a.id, mesh);
   }
+  // The spike: small blinking box, visible when planted or carried (on carrier's back).
+  const spike = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.2, 0.5),
+    new THREE.MeshStandardMaterial({ color: 0x374151, roughness: 0.4, metalness: 0.6, emissive: 0xef4444, emissiveIntensity: 0.4 }));
+  spike.visible = false; scene.add(spike);
+  const spikeLight = new THREE.PointLight(0xef4444, 0, 7, 1.5);
+  scene.add(spikeLight);
 
-  applyQuality(q) {
-    this.quality = q;
-    const dpr = window.devicePixelRatio || 1;
-    const cap = this.isTouch ? [1.0, 1.0, 1.0, 1.0][q] : [1.75, 1.5, 1.25, 1.0][q];
-    this.renderer.setPixelRatio(Math.min(dpr, cap));
-    this.particleScale = q >= 3 ? 0.5 : 1;
+  // Pooled tracers: thin stretched boxes, reused in order.
+  const tracers = [];
+  const tracerMat = new THREE.MeshBasicMaterial({ color: 0xffe9a8, transparent: true, opacity: 0.85 });
+  for (let i = 0; i < MAX_TRACERS; i++) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.02, 1), tracerMat);
+    m.visible = false; scene.add(m); tracers.push({ mesh: m, life: 0 });
   }
-
-  resize(w, h) {
-    this.renderer.setSize(w, h, false);
-    this.camera.aspect = w / h;
-    this.camera.updateProjectionMatrix();
+  // Pooled impact particles: small points cloud, one geometry, positions rewritten.
+  const pGeo = new THREE.BufferGeometry();
+  const pPos = new Float32Array(MAX_PARTICLES * 3);
+  const pVel = new Float32Array(MAX_PARTICLES * 3);
+  const pLife = new Float32Array(MAX_PARTICLES);
+  pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+  const points = new THREE.Points(pGeo, new THREE.PointsMaterial({ color: 0xd8c49a, size: 0.09, transparent: true, opacity: 0.95 }));
+  points.frustumCulled = false; scene.add(points);
+  let pCursor = 0;
+  // Pooled smoke puffs: sprite planes with a radial-gradient canvas texture.
+  const smokeTex = makeSmokeTexture();
+  const smokes = [];
+  for (let i = 0; i < MAX_SMOKE; i++) {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(7, 7),
+      new THREE.MeshBasicMaterial({ map: smokeTex, transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide }));
+    m.visible = false; scene.add(m); smokes.push({ mesh: m, life: 0, max: 1 });
   }
+  return { renderer, scene, camera, viewmodel, muzzle, actorMeshes, spike, spikeLight, tracers, points, pPos, pVel, pLife, pCursor, smokes };
+}
 
-  // --- tracers: pooled THREE.Line segments, additive, fade in 70ms ---
-  _initTracers() {
-    this.tracers = [];
-    for (let i = 0; i < TRACER_MAX; i++) {
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
-      const mat = new THREE.LineBasicMaterial({ color: 0xffb347, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false });
-      const line = new THREE.Line(geo, mat);
-      line.frustumCulled = false;
-      line.visible = false;
-      this.scene.add(line);
-      this.tracers.push({ line, life: 0 });
+function makeSmokeTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(64, 64, 4, 64, 64, 62);
+  grad.addColorStop(0, 'rgba(225,228,230,0.85)');
+  grad.addColorStop(0.6, 'rgba(210,214,216,0.45)');
+  grad.addColorStop(1, 'rgba(210,214,216,0)');
+  g.fillStyle = grad; g.fillRect(0, 0, 128, 128);
+  const tex = new THREE.CanvasTexture(c);
+  return tex;
+}
+
+function spawnTracer(r, e) {
+  let slot = r.tracers.find(t => t.life <= 0) || r.tracers[0];
+  const dx = e.ex - e.x, dy = e.ey - e.y, dz = e.ez - e.z;
+  const len = Math.hypot(dx, dy, dz) || 1;
+  slot.mesh.visible = true;
+  slot.mesh.position.set((e.x + e.ex) / 2, (e.y + e.ey) / 2, (e.z + e.ez) / 2);
+  slot.mesh.scale.set(1, 1, len);
+  slot.mesh.lookAt(e.ex, e.ey, e.ez);
+  slot.life = 0.07;
+}
+function spawnImpact(r, x, y, z) {
+  for (let n = 0; n < 10; n++) {
+    const i = r.pCursor; r.pCursor = (r.pCursor + 1) % MAX_PARTICLES;
+    r.pPos[i * 3] = x; r.pPos[i * 3 + 1] = y; r.pPos[i * 3 + 2] = z;
+    r.pVel[i * 3] = (Math.random() - 0.5) * 3.2;
+    r.pVel[i * 3 + 1] = Math.random() * 2.6 + 0.4;
+    r.pVel[i * 3 + 2] = (Math.random() - 0.5) * 3.2;
+    r.pLife[i] = 0.5;
+  }
+  r.points.geometry.attributes.position.needsUpdate = true;
+}
+
+// Consume this frame's sim events that have a visual (audio/hud drain theirs).
+export function consumeVisualEvents(r, state) {
+  for (const e of state.events) {
+    if (e.type === 'tracer') spawnTracer(r, e);
+    else if (e.type === 'impact') spawnImpact(r, e.x, e.y, e.z);
+    else if (e.type === 'explosion') {
+      spawnImpact(r, e.x, e.y + 0.4, e.z);
+      spawnImpact(r, e.x, e.y + 0.9, e.z);
+      r.muzzle.intensity = 0;
+    } else if (e.type === 'smoke') {
+      const slot = r.smokes.find(s => s.life <= 0) || r.smokes[0];
+      slot.mesh.visible = true;
+      slot.mesh.position.set(e.x, e.y + 1.2, e.z);
+      slot.life = 14; slot.max = 14;
     }
-    this.tracerIdx = 0;
   }
+}
 
-  spawnTracer(from, to, color) {
-    const t = this.tracers[this.tracerIdx];
-    this.tracerIdx = (this.tracerIdx + 1) % TRACER_MAX;
-    const pos = t.line.geometry.attributes.position.array;
-    pos[0] = from.x; pos[1] = from.y; pos[2] = from.z;
-    pos[3] = to.x; pos[4] = to.y; pos[5] = to.z;
-    t.line.geometry.attributes.position.needsUpdate = true;
-    t.line.material.color.setHex(color || 0xffb347);
-    t.line.material.opacity = 0.85;
-    t.line.visible = true;
-    t.life = 0.07;
+// Per-frame sync: actors, spike, camera, pools.
+export function renderFrame(r, state, player, dt, time) {
+  const cam = r.camera;
+  // Camera: player eye + recoil pitch + walk bob + ADS zoom.
+  const gun = player.weapons[player.slot];
+  const ads = player.ads && gun && gun.def.zoom > 1;
+  const targetFov = ads ? 74 / gun.def.zoom : 74;
+  if (Math.abs(cam.fov - targetFov) > 0.1) { cam.fov += (targetFov - cam.fov) * Math.min(1, dt * 10); cam.updateProjectionMatrix(); }
+  const bob = player.moveMag * (player.onGround ? 0.028 : 0);
+  const bobT = time * (player.crouch ? 6 : 9);
+  cam.position.set(player.pos.x, eyeHeight(player) + Math.sin(bobT) * bob, player.pos.z);
+  cam.rotation.order = 'YXZ';
+  cam.rotation.y = player.yaw;
+  cam.rotation.x = player.pitch + Math.sin(bobT * 0.5) * bob * 0.4;
+  cam.rotation.z = Math.cos(bobT) * bob * 0.25;
+  // Viewmodel: recoil kick + reload dip + ADS centre.
+  const vm = r.viewmodel;
+  const kick = gun ? gun.bloom * 6 : 0;
+  const adsX = ads ? 0 : 0.24, adsY = ads ? -0.185 : -0.26;
+  vm.position.x += (adsX - vm.position.x) * Math.min(1, dt * 12);
+  vm.position.y += (adsY - vm.position.y) * Math.min(1, dt * 12);
+  vm.position.z = -0.5 + kick + (gun && gun.reloading > 0 ? 0.16 : 0);
+  vm.rotation.x = kick * 1.4;
+  r.muzzle.intensity = Math.max(0, r.muzzle.intensity - dt * 60);
+
+  // Actors: position, yaw, walk-cycle legs, death = fall + fade out.
+  for (const a of state.actors) {
+    const mesh = r.actorMeshes.get(a.id);
+    if (!mesh) continue;
+    if (a.isPlayer) { mesh.visible = false; continue; }
+    if (!a.alive) {
+      mesh.visible = mesh.userData.fallT === undefined || mesh.userData.fallT < 0.6;
+      if (mesh.visible) {
+        mesh.userData.fallT = (mesh.userData.fallT || 0) + dt;
+        mesh.rotation.x = Math.min(Math.PI / 2, (mesh.userData.fallT || 0) * 4);
+        mesh.position.y = -0.3;
+      }
+      continue;
+    }
+    mesh.userData.fallT = 0;
+    mesh.visible = true;
+    mesh.position.set(a.pos.x, a.pos.y, a.pos.z);
+    mesh.rotation.y = a.yaw + Math.PI; // model faces +z; yaw 0 faces -z
+    const swing = a.moveMag * Math.sin(time * 11 + a.id * 2) * 0.55;
+    mesh.userData.legL.rotation.x = swing;
+    mesh.userData.legR.rotation.x = -swing;
+    mesh.userData.armL.rotation.x = -0.9 - swing * 0.3;
+    const scaleY = a.crouch ? 0.72 : 1;
+    mesh.scale.y += (scaleY - mesh.scale.y) * Math.min(1, dt * 10);
   }
-
-  updateTracers(dt) {
-    for (let i = 0; i < TRACER_MAX; i++) {
-      const t = this.tracers[i];
-      if (t.life <= 0) continue;
-      t.life -= dt;
-      if (t.life <= 0) { t.line.visible = false; continue; }
-      t.line.material.opacity = Math.max(0, t.life / 0.07) * 0.85;
+  // Spike.
+  const bomb = state.bomb;
+  if (bomb.state === 'planted') {
+    r.spike.visible = true;
+    r.spike.position.set(bomb.x, 0.12, bomb.z);
+    r.spike.rotation.y = time * 0.5;
+    r.spikeLight.position.set(bomb.x, 0.8, bomb.z);
+    r.spikeLight.intensity = 2 + Math.sin(time * 9) * 1.6;
+  } else {
+    const carrier = state.actors.find(a => a.hasSpike && a.alive && !a.isPlayer);
+    if (carrier) {
+      r.spike.visible = true;
+      r.spike.position.set(carrier.pos.x, 1.35, carrier.pos.z);
+      r.spike.rotation.y = carrier.yaw;
+      r.spikeLight.intensity = 0;
+    } else r.spike.visible = false;
+  }
+  // Pools decay.
+  for (const t of r.tracers) { if (t.life > 0) { t.life -= dt; if (t.life <= 0) t.mesh.visible = false; } }
+  for (let i = 0; i < MAX_PARTICLES; i++) {
+    if (r.pLife[i] > 0) {
+      r.pLife[i] -= dt;
+      r.pPos[i * 3] += r.pVel[i * 3] * dt;
+      r.pPos[i * 3 + 1] += r.pVel[i * 3 + 1] * dt;
+      r.pPos[i * 3 + 2] += r.pVel[i * 3 + 2] * dt;
+      r.pVel[i * 3 + 1] -= 6 * dt;
+      if (r.pLife[i] <= 0) { r.pPos[i * 3 + 1] = -50; }
     }
   }
-
-  // --- particles: one THREE.Points, fixed buffer, ring allocation ---
-  _initParticles() {
-    this.pGeo = new THREE.BufferGeometry();
-    this.pPos = new Float32Array(PARTICLE_MAX * 3);
-    this.pVel = new Float32Array(PARTICLE_MAX * 3);
-    this.pLife = new Float32Array(PARTICLE_MAX);
-    this.pGeo.setAttribute('position', new THREE.BufferAttribute(this.pPos, 3));
-    const mat = new THREE.PointsMaterial({ color: 0xffc46b, size: 0.14, transparent: true, opacity: 0.95, depthWrite: false });
-    this.points = new THREE.Points(this.pGeo, mat);
-    this.points.frustumCulled = false;
-    this.scene.add(this.points);
-    this.pCursor = 0;
-    for (let i = 0; i < PARTICLE_MAX; i++) this.pPos[i * 3 + 1] = -50; // park below ground
-  }
-
-  spawnParticles(x, y, z, n, spread, up, color) {
-    const count = Math.round(n * (this.particleScale || 1));
-    for (let k = 0; k < count; k++) {
-      const i = this.pCursor;
-      this.pCursor = (this.pCursor + 1) % PARTICLE_MAX;
-      this.pPos[i * 3] = x; this.pPos[i * 3 + 1] = y; this.pPos[i * 3 + 2] = z;
-      const a = (k / Math.max(1, count)) * Math.PI * 2 + (i % 7) * 0.35;
-      const sp = spread * (0.4 + ((i * 13) % 10) / 16);
-      this.pVel[i * 3] = Math.cos(a) * sp;
-      this.pVel[i * 3 + 1] = up * (0.5 + ((i * 7) % 10) / 14);
-      this.pVel[i * 3 + 2] = Math.sin(a) * sp;
-      this.pLife[i] = 0.35 + ((i * 11) % 10) / 40;
+  r.points.geometry.attributes.position.needsUpdate = true;
+  for (const s of r.smokes) {
+    if (s.life > 0) {
+      s.life -= dt;
+      s.mesh.material.opacity = Math.min(0.85, s.life / 2) * (s.life > s.max - 1 ? (s.max - s.life) : 1);
+      s.mesh.lookAt(cam.position);
+      if (s.life <= 0) s.mesh.visible = false;
     }
-    if (color) this.points.material.color.setHex(color);
   }
+  r.renderer.render(r.scene, cam);
+}
 
-  updateParticles(dt) {
-    let any = false;
-    for (let i = 0; i < PARTICLE_MAX; i++) {
-      if (this.pLife[i] <= 0) continue;
-      any = true;
-      this.pLife[i] -= dt;
-      if (this.pLife[i] <= 0) { this.pPos[i * 3 + 1] = -50; continue; }
-      this.pVel[i * 3 + 1] -= 9.5 * dt;
-      this.pPos[i * 3] += this.pVel[i * 3] * dt;
-      this.pPos[i * 3 + 1] += this.pVel[i * 3 + 1] * dt;
-      this.pPos[i * 3 + 2] += this.pVel[i * 3 + 2] * dt;
-      if (this.pPos[i * 3 + 1] < 0.03) { this.pPos[i * 3 + 1] = 0.03; this.pVel[i * 3 + 1] *= -0.3; }
-    }
-    if (any) this.pGeo.attributes.position.needsUpdate = true;
-  }
-
-  // --- bot meshes: low-poly humanoid, team-coloured, one shared geometry ---
-  makeBotMesh(team) {
-    const g = new THREE.Group();
-    const suit = team === 'atk' ? 0x3f6d4e : 0x8a3b2e;   // green attackers, rust defenders
-    const dark = 0x22262b;
-    const skin = 0xc9a06a;
-    const matSuit = new THREE.MeshStandardMaterial({ color: suit, roughness: 0.85 });
-    const matDark = new THREE.MeshStandardMaterial({ color: dark, roughness: 0.9 });
-    const matSkin = new THREE.MeshStandardMaterial({ color: skin, roughness: 0.8 });
-    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.62, 0.3), matSuit);
-    torso.position.y = 1.12; torso.castShadow = true;
-    const head = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.3, 0.3), matSkin);
-    head.position.y = 1.62; head.castShadow = true;
-    const helm = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.12, 0.34), matDark);
-    helm.position.y = 1.78;
-    const legL = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.62, 0.24), matDark);
-    legL.position.set(-0.14, 0.42, 0);
-    const legR = legL.clone(); legR.position.x = 0.14;
-    const armL = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.55, 0.18), matSuit);
-    armL.position.set(-0.36, 1.14, 0.08);
-    const armR = armL.clone(); armR.position.x = 0.36;
-    const gun = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.12, 0.62), matDark);
-    gun.position.set(0.18, 1.28, 0.32);
-    // team stripe so bots read at combat distance, never camouflage
-    const stripe = new THREE.Mesh(new THREE.BoxGeometry(0.54, 0.1, 0.32),
-      new THREE.MeshBasicMaterial({ color: team === 'atk' ? 0x59d67a : 0xff5a3c }));
-    stripe.position.y = 1.34;
-    g.add(torso, head, helm, legL, legR, armL, armR, gun, stripe);
-    g.userData = { head, torso, legL, legR, armL, armR, stripe };
-    return g;
-  }
-
-  // Simple walk-cycle: legs/arms swing with distance travelled.
-  animateBot(mesh, speed, dt, crouched) {
-    const u = mesh.userData;
-    const phase = (mesh.userData.phase = (mesh.userData.phase || 0) + dt * speed * 2.4);
-    const amp = clamp(speed / 4.4, 0, 1) * 0.55;
-    u.legL.rotation.x = Math.sin(phase) * amp;
-    u.legR.rotation.x = -Math.sin(phase) * amp;
-    u.armL.rotation.x = -Math.sin(phase) * amp * 0.7;
-    u.armR.rotation.x = Math.sin(phase) * amp * 0.7;
-    const targetY = crouched ? 0.72 : 1.0;
-    mesh.scale.y += (targetY - mesh.scale.y) * Math.min(1, dt * 10);
-  }
-
-  // --- first-person viewmodel: boxy rifle that bobs, kicks, dips ---
-  _buildViewmodel() {
-    const g = new THREE.Group();
-    const dark = new THREE.MeshStandardMaterial({ color: 0x2b2f36, roughness: 0.5, metalness: 0.6 });
-    const mid = new THREE.MeshStandardMaterial({ color: 0x3d434d, roughness: 0.45, metalness: 0.6 });
-    const accent = new THREE.MeshStandardMaterial({ color: 0xff8c2e, roughness: 0.5, metalness: 0.4 });
-    const body = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.13, 0.46), dark);
-    const barrel = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 0.3), mid);
-    barrel.position.set(0, 0.02, -0.36);
-    const tip = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.06, 0.06), accent);
-    tip.position.set(0, 0.02, -0.52);
-    const mag = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.16, 0.1), new THREE.MeshStandardMaterial({ color: 0x2b2f36, roughness: 0.55, metalness: 0.55 }));
-    mag.position.set(0, -0.12, -0.05);
-    const grip = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.14, 0.08), accent);
-    grip.position.set(0, -0.1, 0.14);
-    const stock = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.11, 0.14), dark);
-    stock.position.set(0, -0.01, 0.28);
-    const sight = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.06, 0.1), accent);
-    sight.position.set(0, 0.09, -0.1);
-    g.add(body, barrel, tip, mag, grip, stock, sight);
-    g.scale.setScalar(0.85);
-    g.position.set(0.3, -0.27, -0.55);
-    this.viewmodel = g;
-    this.vmBase = { x: 0.3, y: -0.27, z: -0.55 };
-    this.vmKick = 0;
-    this.vmDip = 0;
-    this.camera.add(g);
-    this.scene.add(this.camera);
-    // Muzzle flash quad at the barrel tip.
-    const flashMat = new THREE.MeshBasicMaterial({ color: 0xffd27a, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false });
-    this.muzzleQuad = new THREE.Mesh(new THREE.PlaneGeometry(0.22, 0.22), flashMat);
-    this.muzzleQuad.position.set(0.3, -0.23, -0.95);
-    this.camera.add(this.muzzleQuad);
-  }
-
-  setViewmodel(kind) {
-    // Recolour the accent parts per weapon family so the switch reads.
-    const accent = kind === 'sniper' ? 0x6fb7ff : kind === 'smg' ? 0x59d67a : kind === 'shotgun' ? 0xff5a3c : 0xff8c2e;
-    this.viewmodel.children.forEach((c) => {
-      if (c.material && c.material.color && c.position.y < -0.09) c.material.color.setHex(accent);
-    });
-  }
-
-  updateViewmodel(dt, moving, firing, reloading) {
-    const t = performance.now() * 0.001;
-    const bob = moving ? Math.sin(t * 9) * 0.008 : 0;
-    const bobY = moving ? Math.abs(Math.cos(t * 9)) * 0.01 : 0;
-    this.vmKick = Math.max(0, this.vmKick - dt * 6);
-    this.vmDip = Math.max(0, this.vmDip - dt * 2.2);
-    const vm = this.viewmodel;
-    vm.position.set(
-      this.vmBase.x + bob,
-      this.vmBase.y + bobY - this.vmDip * 0.12,
-      this.vmBase.z + this.vmKick * 0.09,
-    );
-    vm.rotation.x = this.vmKick * 0.16 + this.vmDip * 0.5;
-    if (reloading) this.vmDip = Math.max(this.vmDip, 0.55);
-    // Muzzle flash decay.
-    this.flashT = Math.max(0, this.flashT - dt * 22);
-    this.muzzleQuad.material.opacity = this.flashT > 0 ? 0.9 : 0;
-    this.muzzleQuad.rotation.z = Math.random() * Math.PI;
-    this.muzzleLight.intensity = this.flashT > 0 ? 2.2 : 0;
-  }
-
-  muzzleFlashAt(pos) {
-    this.muzzleLight.position.copy(pos);
-    this.flashT = 1;
-  }
-
-  render() {
-    this.renderer.render(this.scene, this.camera);
-  }
+export function resizeRenderer(r, appEl) {
+  r.camera.aspect = appEl.clientWidth / appEl.clientHeight;
+  r.camera.updateProjectionMatrix();
+  r.renderer.setSize(appEl.clientWidth, appEl.clientHeight);
 }

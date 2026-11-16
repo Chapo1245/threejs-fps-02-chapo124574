@@ -1,96 +1,94 @@
-// state.js — one central store for the whole game. No imports.
-// Every module reads and writes this single object; nothing else holds
-// long-lived game state. Helpers here are pure and allocation-free.
+// state.js — the single store. Every module reads and writes this one object;
+// nothing else keeps authoritative game state. Fixed-step sim ticks it at 60 Hz.
+export const TICK = 1 / 60;
+export const ROUND_TARGET = 5;      // first to 5 rounds wins the match
+export const ROUND_TIME = 100;      // seconds of live play per round
+export const BUY_TIME = 12;         // seconds of freeze / buy phase
+export const BOMB_TIME = 35;        // seconds from plant to detonation
+export const PLANT_TIME = 3.2;      // seconds holding E to plant
+export const DEFUSE_TIME = 5.0;     // seconds holding E to defuse (2.5 with kit)
+export const PLAYER_RADIUS = 0.42;
+export const PLAYER_HEIGHT = 1.72;
+export const CROUCH_HEIGHT = 1.12;
+export const EYE_STAND = 1.62;
+export const EYE_CROUCH = 1.05;
 
-export function mulberry32(seed) {
-  let a = seed >>> 0;
-  return function () {
-    a |= 0; a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
+// Economy (dollars). All awards are paid by sim.award(), never inline.
+export const ECO = {
+  start: 800, kill: 300, win: 3250, loss: 1900, lossStreak: 500,
+  plant: 300, defuse: 300, assist: 100,
+};
 
-export const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
-export const lerp = (a, b, t) => a + (b - a) * t;
-export const TAU = Math.PI * 2;
-
-// Deterministic shuffle with an injected rng (no Math.random in sim).
-export function shuffle(arr, rng) {
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = (rng() * (i + 1)) | 0;
-    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
-  }
-  return arr;
-}
-
-// Fresh state for one match. Call resetMatch() between matches.
-export function createState(seed) {
+export function makeActor(id, name, team, isPlayer, x, z, yaw) {
   return {
-    seed: seed >>> 0,
-    rng: mulberry32(seed >>> 0),
-    time: 0,            // sim time, seconds (fixed step)
-    tick: 0,
-    mode: 'menu',       // menu | buy | play | roundEnd | matchEnd | paused
-    variant: 'slagworks',
-    difficulty: 'normal',
-    round: 1,
-    maxRounds: 9,
-    winTarget: 5,
-    score: { atk: 0, def: 0 },
-    phase: 'buy',       // buy | live | planted | over
-    phaseT: 0,          // seconds left in current phase
-    buyTime: 12,
-    roundTime: 100,
-    bombTime: 35,
-    plantTime: 3,
-    defuseTime: 5,
-    bomb: { planted: false, site: null, x: 0, z: 0, t: 0, planter: null, defuser: null, defuseT: 0 },
-    money: 800,
-    lossStreak: 0,
-    kills: 0,
-    deaths: 0,
-    player: null,       // filled by player.js
-    bots: [],           // filled by bots.js
-    smokes: [],         // {x,y,z,r,t}
-    grenades: [],       // live grenade entities
-    events: [],         // kill feed entries {text, kind, t}
-    lastKillFeed: 0,
-    stats: { shots: 0, hits: 0, headshots: 0 },
-    roundKills: 0,
-    matchWinner: null,
-    spectate: 0,
-    paused: false,
-    // perf / quality, owned by main.js
-    quality: 0,         // 0 best .. 3 lowest
-    isTouch: false,
-    fpsEMA: 60,
-    // transient per-frame flags (reset each tick by main.js)
-    flash: 0,           // damage vignette 0..1
-    hitmark: 0,         // hitmarker timer
-    hitmarkKill: false,
-    damageDir: -1,      // radians, direction damage came from, -1 none
-    banner: null,       // {title, sub, kind, t}
-    shake: 0,
+    id, name, team, isPlayer,
+    pos: { x, z, y: 0 }, vel: { x: 0, z: 0 }, yaw, pitch: 0,
+    hp: 100, armor: 0, alive: true, crouch: false, onGround: true,
+    weapons: [], slot: 0, grenades: { frag: 0, smoke: 0, flash: 0 },
+    selectedGrenade: 'frag', kills: 0, deaths: 0, money: ECO.start,
+    hasKit: false, hasSpike: false, planting: 0, defusing: 0,
+    flash: 0,            // seconds of flash blindness remaining
+    moveMag: 0,          // 0..1 how much the actor is moving (drives spread)
+    lastDamageFrom: null, lastDamageAt: 0,
+    // bot brain (unused by the human player)
+    bot: isPlayer ? null : {
+      skill: 0.5, state: 'route', node: 0, path: [], holdUntil: 0,
+      target: null, lastSeen: null, lastSeenAt: -99, burstLeft: 0,
+      nextShotAt: 0, strafeDir: 1, strafeUntil: 0, threwGrenade: false,
+      site: 'A', lane: 0, radioAt: 0, investigate: null, reactAt: 0,
+      aimErr: 0.05, holdPos: null, plantSite: null, stuckAt: 0, stuckPos: null,
+    },
   };
 }
 
-export function resetMatch(S, seed) {
-  const fresh = createState(seed);
-  // keep perf fields
-  fresh.quality = S.quality; fresh.isTouch = S.isTouch; fresh.fpsEMA = S.fpsEMA;
-  Object.keys(S).forEach(k => delete S[k]);
-  Object.assign(S, fresh);
+export function createState(mapDef) {
+  return {
+    map: mapDef,
+    phase: 'menu',        // menu | buy | live | roundEnd | matchEnd
+    phaseT: 0,            // seconds in the current phase
+    round: 1,
+    score: { A: 0, B: 0 },
+    lossStreak: { A: 0, B: 0 },
+    roundTime: ROUND_TIME,
+    targetSite: 'A',
+    bomb: { state: 'carried', x: 0, z: 0, site: null, timer: 0, planter: null, defuser: null, progress: 0 },
+    actors: [],
+    events: [],           // transient sim events consumed by hud/audio/render each tick
+    feed: [],             // killfeed lines {a, b, aTeam, bTeam, text, t}
+    radio: [],            // bot radio callouts {team, text, t}
+    shots: [],            // gunfire sound events {x, z, loud} for bot hearing
+    time: 0,              // total sim seconds
+    tickCount: 0,
+    winner: null,         // 'A' | 'B' when the match ends
+    roundWinner: null,
+    roundReason: '',
+    muted: false,
+    demo: null,           // ?demo=combat|buy|plant|score — arranges a scene for screenshots
+  };
 }
 
-// Round banner helper — HUD reads S.banner.
-export function setBanner(S, title, sub, kind) {
-  S.banner = { title, sub: sub || '', kind: kind || 'info', t: 2.6 };
+// Small helpers shared by every module (no allocations in hot paths beyond these).
+export function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+export function lerp(a, b, t) { return a + (b - a) * t; }
+export function dist2(ax, az, bx, bz) { const dx = ax - bx, dz = az - bz; return dx * dx + dz * dz; }
+export function angleLerp(a, b, t) {
+  let d = b - a;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return a + d * t;
 }
-
-// Kill feed helper — newest first, capped by hud.js.
-export function pushEvent(S, text, kind) {
-  S.events.unshift({ text, kind: kind || 'info', t: S.time });
-  if (S.events.length > 6) S.events.length = 6;
+export function angleDiff(a, b) {
+  let d = b - a;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+// Deterministic per-round pseudo-random stream (seeded from round + map) so bot
+// behaviour is stable for a given round; rendering never consumes it.
+export function makeRng(seed) {
+  let s = seed >>> 0 || 1;
+  return function () {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
 }

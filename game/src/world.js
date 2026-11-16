@@ -1,262 +1,187 @@
-// world.js — builds the three.js scene for one layout and owns all
-// spatial queries: AABB collision, line of sight, waypoint routes.
-// Static geometry goes into two InstancedMeshes (walls, crates) so the
-// whole map costs a handful of draw calls. No per-frame allocation:
-// every query reuses module-level scratch values.
-
+// world.js — builds the three.js scene from a map definition and owns every
+// spatial query the sim needs: AABB collision, line-of-sight, nav-graph BFS.
+// Rendering of actors/effects lives in render.js; this file only builds statics.
 import * as THREE from 'three';
-import { COLOR_KEYS } from './layouts.js';
 
-// 2D segment vs AABB slab test. Returns true when the segment crosses
-// the box (in XZ) and the box is tall enough to block the sight line.
-function segmentHitsBox(x0, z0, x1, z1, b, eyeLo) {
-  if (b.h < eyeLo) return false; // low cover never blocks sight
-  const dx = x1 - x0, dz = z1 - z0;
-  let t0 = 0, t1 = 1;
-  const bx0 = b.x - b.w / 2, bx1 = b.x + b.w / 2;
-  const bz0 = b.z - b.d / 2, bz1 = b.z + b.d / 2;
-  if (Math.abs(dx) < 1e-9) { if (x0 < bx0 || x0 > bx1) return false; }
-  else {
-    let ta = (bx0 - x0) / dx, tb = (bx1 - x0) / dx;
-    if (ta > tb) { const t = ta; ta = tb; tb = t; }
-    if (ta > t0) t0 = ta;
-    if (tb < t1) t1 = tb;
-    if (t0 > t1) return false;
+// One reusable box geometry; per-box meshes share it (few dozen boxes, cheap).
+const BOX = new THREE.BoxGeometry(1, 1, 1);
+const BARREL = new THREE.CylinderGeometry(0.42, 0.42, 1.05, 10);
+const LAMP_POLE = new THREE.CylinderGeometry(0.07, 0.09, 4.4, 6);
+const LAMP_HEAD = new THREE.BoxGeometry(0.7, 0.22, 0.34);
+const PIPE = new THREE.CylinderGeometry(0.16, 0.16, 1, 8);
+
+export function buildWorld(scene, map) {
+  const pal = map.palette;
+  const mats = {};
+  for (const [k, v] of Object.entries(pal)) mats[k] = new THREE.MeshStandardMaterial({ color: v, roughness: 0.92, metalness: 0.04 });
+  mats.copper.metalness = 0.55; mats.copper.roughness = 0.45;
+  mats.copperDark.metalness = 0.5; mats.copperDark.roughness = 0.5;
+  mats.pipe.metalness = 0.6; mats.pipe.roughness = 0.4;
+  mats.lamp = new THREE.MeshStandardMaterial({ color: 0xf5d76e, emissive: 0xcf9f2e, emissiveIntensity: 0.9 });
+
+  // Sky, fog, lights — decided once at boot, never toggled at runtime.
+  scene.background = new THREE.Color(pal.sky);
+  scene.fog = new THREE.Fog(pal.fog, 55, 130);
+  const hemi = new THREE.HemisphereLight(map.hemi.sky, map.hemi.ground, map.hemi.intensity);
+  scene.add(hemi);
+  const sun = new THREE.DirectionalLight(map.sun.color, map.sun.intensity);
+  sun.position.set(...map.sun.pos);
+  sun.castShadow = map.sun.shadow;
+  if (sun.castShadow) {
+    sun.shadow.mapSize.set(1024, 1024);
+    sun.shadow.camera.left = -40; sun.shadow.camera.right = 40;
+    sun.shadow.camera.top = 40; sun.shadow.camera.bottom = -40;
+    sun.shadow.camera.far = 120; sun.shadow.bias = -0.0004;
   }
-  if (Math.abs(dz) < 1e-9) { if (z0 < bz0 || z0 > bz1) return false; }
+  scene.add(sun);
+
+  // Ground: big slab + canal strip + site paint rings.
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(map.size.w + 4, map.size.d + 4),
+    new THREE.MeshStandardMaterial({ color: pal.ground, roughness: 0.96 }));
+  ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true;
+  scene.add(ground);
+  if (map.canal) {
+    const c = map.canal;
+    const water = new THREE.Mesh(new THREE.PlaneGeometry(c.x1 - c.x0, c.z1 - c.z0),
+      new THREE.MeshStandardMaterial({ color: pal.canal, roughness: 0.25, metalness: 0.35 }));
+    water.rotation.x = -Math.PI / 2;
+    water.position.set((c.x0 + c.x1) / 2, 0.02, (c.z0 + c.z1) / 2);
+    scene.add(water);
+  }
+  for (const [key, site] of Object.entries(map.sites)) {
+    const ring = new THREE.Mesh(new THREE.RingGeometry(site.r - 0.35, site.r, 40),
+      new THREE.MeshBasicMaterial({ color: pal[site.color], transparent: true, opacity: 0.85, side: THREE.DoubleSide }));
+    ring.rotation.x = -Math.PI / 2; ring.position.set(site.x, 0.03, site.z);
+    scene.add(ring);
+    const disc = new THREE.Mesh(new THREE.CircleGeometry(site.r - 0.4, 32),
+      new THREE.MeshBasicMaterial({ color: pal[site.color], transparent: true, opacity: 0.10, side: THREE.DoubleSide }));
+    disc.rotation.x = -Math.PI / 2; disc.position.set(site.x, 0.025, site.z);
+    scene.add(disc);
+  }
+
+  // Solid boxes: mesh + collision AABB. Boxes stacked on the same footprint
+  // (roof caps, container stacks) merge into one collider up to the top box,
+  // so a bullet over a low box cannot pass through the stack above it.
+  const colliderMap = new Map();
+  for (const b of map.boxes) {
+    const m = new THREE.Mesh(BOX, mats[b.c] || mats.wall);
+    m.position.set(b.x, (b.y || 0) + b.h / 2, b.z);
+    m.scale.set(b.w, b.h, b.d);
+    m.castShadow = b.h > 2; m.receiveShadow = true;
+    scene.add(m);
+    const key = b.x + ',' + b.z + ',' + b.w + ',' + b.d;
+    const top = (b.y || 0) + b.h;
+    const prev = colliderMap.get(key);
+    if (!prev || top > prev.h) {
+      colliderMap.set(key, { minX: b.x - b.w / 2, maxX: b.x + b.w / 2, minZ: b.z - b.d / 2, maxZ: b.z + b.d / 2, h: top });
+    }
+  }
+  const colliders = [...colliderMap.values()];
+  // Props.
+  for (const p of map.props) {
+    if (p.kind === 'barrel') {
+      const m = new THREE.Mesh(BARREL, mats[p.c] || mats.rust);
+      m.position.set(p.x, 0.53, p.z); m.castShadow = true; scene.add(m);
+      colliders.push({ minX: p.x - 0.42, maxX: p.x + 0.42, minZ: p.z - 0.42, maxZ: p.z + 0.42, h: 1.05 });
+    } else if (p.kind === 'lamp') {
+      const pole = new THREE.Mesh(LAMP_POLE, mats.wallDark);
+      pole.position.set(p.x, 2.2, p.z); scene.add(pole);
+      const head = new THREE.Mesh(LAMP_HEAD, mats.lamp);
+      head.position.set(p.x, 4.5, p.z); scene.add(head);
+      const glow = new THREE.PointLight(0xffd98a, 6, 12, 1.6);
+      glow.position.set(p.x, 4.3, p.z); scene.add(glow);
+    } else if (p.kind === 'pipe') {
+      const m = new THREE.Mesh(PIPE, mats.pipe);
+      m.rotation.z = Math.PI / 2; m.scale.y = p.w || 4;
+      m.position.set(p.x, 3.4, p.z); scene.add(m);
+    }
+  }
+  return { colliders, mats, sun };
+}
+
+// --- Collision: circle (actor) vs AABBs, resolved axis by axis. -------------
+export function collideCircle(colliders, x, z, r) {
+  for (const c of colliders) {
+    const nx = Math.max(c.minX, Math.min(x, c.maxX));
+    const nz = Math.max(c.minZ, Math.min(z, c.maxZ));
+    const dx = x - nx, dz = z - nz;
+    const d2 = dx * dx + dz * dz;
+    if (d2 < r * r && d2 > 1e-8) {
+      const d = Math.sqrt(d2);
+      x = nx + (dx / d) * r; z = nz + (dz / d) * r;
+    } else if (d2 <= 1e-8) {
+      // Centre inside the box: push out along the smallest penetration axis.
+      const pl = x - c.minX, pr = c.maxX - x, pt = z - c.minZ, pb = c.maxZ - z;
+      const m = Math.min(pl, pr, pt, pb);
+      if (m === pl) x = c.minX - r; else if (m === pr) x = c.maxX + r;
+      else if (m === pt) z = c.minZ - r; else z = c.maxZ + r;
+    }
+  }
+  return { x, z };
+}
+
+export function pointBlocked(colliders, x, z) {
+  for (const c of colliders) if (x >= c.minX && x <= c.maxX && z >= c.minZ && z <= c.maxZ) return true;
+  return false;
+}
+
+// --- Line of sight: 2D segment vs AABB walls (h >= 1.6 blocks sight). -------
+export function losBlocked(colliders, ax, az, bx, bz) {
+  for (const c of colliders) {
+    if (c.h < 1.6) continue;
+    if (segmentHitsAABB(ax, az, bx, bz, c)) return true;
+  }
+  return false;
+}
+function segmentHitsAABB(ax, az, bx, bz, c) {
+  const dx = bx - ax, dz = bz - az;
+  let tmin = 0, tmax = 1;
+  if (Math.abs(dx) < 1e-9) { if (ax < c.minX || ax > c.maxX) return false; }
   else {
-    let ta = (bz0 - z0) / dz, tb = (bz1 - z0) / dz;
-    if (ta > tb) { const t = ta; ta = tb; tb = t; }
-    if (ta > t0) t0 = ta;
-    if (tb < t1) t1 = tb;
-    if (t0 > t1) return false;
+    let t1 = (c.minX - ax) / dx, t2 = (c.maxX - ax) / dx;
+    if (t1 > t2) { const t = t1; t1 = t2; t2 = t; }
+    tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
+    if (tmin > tmax) return false;
+  }
+  if (Math.abs(dz) < 1e-9) { if (az < c.minZ || az > c.maxZ) return false; }
+  else {
+    let t1 = (c.minZ - az) / dz, t2 = (c.maxZ - az) / dz;
+    if (t1 > t2) { const t = t1; t1 = t2; t2 = t; }
+    tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
+    if (tmin > tmax) return false;
   }
   return true;
 }
 
-export class World {
-  // shadowsOn is decided once at boot (off on touch): toggling a light's
-  // castShadow at runtime recompiles every material — a visible hitch
-  // mid-fight. Adaptive quality only ever changes pixel ratio + particles.
-  constructor(scene, layout, palette, sun, hemi, shadowsOn) {
-    this.layout = layout;
-    this.bounds = layout.bounds;
-    this.colliders = [];
-    for (const w of layout.walls) this.colliders.push(w);
-    for (const c of layout.crates) this.colliders.push(c);
-    this.scene = scene;
-    this.group = new THREE.Group();
-    scene.add(this.group);
-
-    // Ground: one big plane with a subtle grid texture painted by canvas.
-    const groundTex = this._groundTexture(palette.ground);
-    const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(layout.bounds.x * 2 + 4, layout.bounds.z * 2 + 4),
-      new THREE.MeshStandardMaterial({ map: groundTex, roughness: 0.94, metalness: 0.05 }),
-    );
-    ground.rotation.x = -Math.PI / 2;
-    ground.receiveShadow = true;
-    this.group.add(ground);
-
-    // Static boxes as instanced meshes — one per material family.
-    this._instanced(layout.walls, 0.85, 0.12, true);
-    this._instanced(layout.crates, 0.9, 0.08, false);
-
-    // Site markers: flat rings + floating letter boards.
-    this.siteMeshes = {};
-    for (const key of ['A', 'B']) {
-      const s = layout.sites[key];
-      const ring = new THREE.Mesh(
-        new THREE.RingGeometry(s.r - 0.35, s.r, 40),
-        new THREE.MeshBasicMaterial({ color: key === 'A' ? 0xff8c2e : 0x4fc3ff, transparent: true, opacity: 0.75, side: THREE.DoubleSide }),
-      );
-      ring.rotation.x = -Math.PI / 2;
-      ring.position.set(s.x, 0.06, s.z);
-      this.group.add(ring);
-      const board = this._letterBoard(key, key === 'A' ? '#ff8c2e' : '#4fc3ff');
-      board.position.set(s.x, 3.4, s.z);
-      this.group.add(board);
-      this.siteMeshes[key] = ring;
-    }
-
-    // Bomb prop (hidden until planted).
-    const bombGeo = new THREE.BoxGeometry(0.55, 0.35, 0.4);
-    this.bombMesh = new THREE.Mesh(bombGeo, new THREE.MeshStandardMaterial({ color: 0x1c1c22, roughness: 0.4, metalness: 0.7, emissive: 0xcc2200, emissiveIntensity: 0.4 }));
-    this.bombMesh.visible = false;
-    this.bombMesh.castShadow = true;
-    this.group.add(this.bombMesh);
-
-    // Lights: hemisphere + one shadow-casting sun + warm lamps.
-    const hemiLight = new THREE.HemisphereLight(hemi.sky, hemi.ground, hemi.intensity);
-    scene.add(hemiLight);
-    this.sun = new THREE.DirectionalLight(sun.color, sun.intensity);
-    this.sun.position.set(sun.pos[0], sun.pos[1], sun.pos[2]);
-    this.sun.target.position.set(0, 0, 0);
-    const R = Math.max(layout.bounds.x, layout.bounds.z);
-    this.sun.shadow.camera.left = -R - 6; this.sun.shadow.camera.right = R + 6;
-    this.sun.shadow.camera.top = R + 6; this.sun.shadow.camera.bottom = -R - 6;
-    this.sun.shadow.camera.far = 120;
-    this.sun.shadow.mapSize.set(1024, 1024);
-    this.sun.shadow.bias = -0.0006;
-    this.sun.castShadow = shadowsOn;
-    scene.add(this.sun); scene.add(this.sun.target);
-    this.lamps = [];
-    for (const l of layout.lamps) {
-      const pl = new THREE.PointLight(l.color, l.i, 26, 1.6);
-      pl.position.set(l.x, l.y, l.z);
-      scene.add(pl);
-      this.lamps.push(pl);
-    }
-    // Fog + background from the palette.
-    scene.background = new THREE.Color(palette.sky);
-    scene.fog = new THREE.Fog(palette.fog, 45, 130);
-  }
-
-  _groundTexture(base) {
-    const cv = document.createElement('canvas');
-    cv.width = 256; cv.height = 256;
-    const g = cv.getContext('2d');
-    g.fillStyle = '#' + base.toString(16).padStart(6, '0');
-    g.fillRect(0, 0, 256, 256);
-    // speckle + panel seams, deterministic pattern (fixed loop, no RNG)
-    g.strokeStyle = 'rgba(255,255,255,0.05)';
-    g.lineWidth = 2;
-    for (let i = 0; i <= 4; i++) {
-      g.beginPath(); g.moveTo(i * 64, 0); g.lineTo(i * 64, 256); g.stroke();
-      g.beginPath(); g.moveTo(0, i * 64); g.lineTo(256, i * 64); g.stroke();
-    }
-    for (let i = 0; i < 220; i++) {
-      const x = (i * 37) % 256, y = (i * 91) % 256;
-      g.fillStyle = i % 3 ? 'rgba(0,0,0,0.10)' : 'rgba(255,255,255,0.05)';
-      g.fillRect(x, y, 3, 3);
-    }
-    const tex = new THREE.CanvasTexture(cv);
-    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-    tex.repeat.set(8, 6);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    return tex;
-  }
-
-  _instanced(boxes, roughness, metalness, castShadow) {
-    if (!boxes.length) return;
-    const geo = new THREE.BoxGeometry(1, 1, 1);
-    const mat = new THREE.MeshStandardMaterial({ roughness, metalness });
-    const mesh = new THREE.InstancedMesh(geo, mat, boxes.length);
-    const m = new THREE.Matrix4();
-    const col = new THREE.Color();
-    boxes.forEach((b, i) => {
-      m.makeScale(b.w, b.h, b.d);
-      m.setPosition(b.x, b.h / 2, b.z);
-      mesh.setMatrixAt(i, m);
-      col.setHex(COLOR_KEYS[b.c] || 0x888888);
-      mesh.setColorAt(i, col);
-    });
-    mesh.instanceMatrix.needsUpdate = true;
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-    mesh.castShadow = castShadow;
-    mesh.receiveShadow = true;
-    this.group.add(mesh);
-  }
-
-  _letterBoard(letter, colorCss) {
-    const cv = document.createElement('canvas');
-    cv.width = 128; cv.height = 128;
-    const g = cv.getContext('2d');
-    g.fillStyle = 'rgba(10,12,14,0.82)';
-    g.fillRect(0, 0, 128, 128);
-    g.strokeStyle = colorCss; g.lineWidth = 6;
-    g.strokeRect(5, 5, 118, 118);
-    g.fillStyle = colorCss;
-    g.font = 'bold 84px system-ui, sans-serif';
-    g.textAlign = 'center'; g.textBaseline = 'middle';
-    g.fillText(letter, 64, 68);
-    const tex = new THREE.CanvasTexture(cv);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    const mesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(1.7, 1.7),
-      new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide }),
-    );
-    return mesh;
-  }
-
-  // Circle (XZ) vs AABBs. Moves the circle out along the smallest
-  // penetration axis; returns true if any push happened.
-  collideCircle(p, r) {
-    let hit = false;
-    for (let i = 0; i < this.colliders.length; i++) {
-      const b = this.colliders[i];
-      if (p.y > b.h) continue; // feet above the box top top
-      const bx0 = b.x - b.w / 2 - r, bx1 = b.x + b.w / 2 + r;
-      const bz0 = b.z - b.d / 2 - r, bz1 = b.z + b.d / 2 + r;
-      if (p.x < bx0 || p.x > bx1 || p.z < bz0 || p.z > bz1) continue;
-      // inside expanded box: push out on the shallowest axis
-      const dxl = p.x - bx0, dxr = bx1 - p.x;
-      const dzl = p.z - bz0, dzr = bz1 - p.z;
-      const m = Math.min(dxl, dxr, dzl, dzr);
-      if (m === dxl) p.x = bx0;
-      else if (m === dxr) p.x = bx1;
-      else if (m === dzl) p.z = bz0;
-      else p.z = bz1;
-      hit = true;
-    }
-    // Outer bounds clamp.
-    const bx = this.bounds.x - 0.4, bz = this.bounds.z - 0.4;
-    if (p.x < -bx) { p.x = -bx; hit = true; }
-    if (p.x > bx) { p.x = bx; hit = true; }
-    if (p.z < -bz) { p.z = -bz; hit = true; }
-    if (p.z > bz) { p.z = bz; hit = true; }
-    return hit;
-  }
-
-  // Line of sight between two eye positions, blocked by tall boxes and
-  // by active smoke spheres (smokes: [{x,y,z,r}]).
-  hasLOS(ax, ay, az, bx, by, bz, smokes) {
-    const eyeLo = Math.min(ay, by) - 0.15;
-    for (let i = 0; i < this.colliders.length; i++) {
-      if (segmentHitsBox(ax, az, bx, bz, this.colliders[i], eyeLo)) return false;
-    }
-    if (smokes) {
-      for (let i = 0; i < smokes.length; i++) {
-        const s = smokes[i];
-        if (this._segSphere(ax, ay, az, bx, by, bz, s.x, s.y, s.z, s.r)) return false;
+// --- Nav graph: BFS shortest path between node indices. ---------------------
+export function findPath(map, from, to) {
+  if (from === to) return [to];
+  const prev = new Array(map.nodes.length).fill(-1);
+  const queue = [from]; prev[from] = from;
+  while (queue.length) {
+    const cur = queue.shift();
+    for (const [a, b] of map.links) {
+      const nxt = a === cur ? b : b === cur ? a : -1;
+      if (nxt >= 0 && prev[nxt] === -1) {
+        prev[nxt] = cur;
+        if (nxt === to) {
+          const path = [to]; let n = to;
+          while (n !== from) { n = prev[n]; path.unshift(n); }
+          return path;
+        }
+        queue.push(nxt);
       }
     }
-    return true;
   }
+  return [to];
+}
 
-  _segSphere(ax, ay, az, bx, by, bz, cx, cy, cz, r) {
-    const dx = bx - ax, dy = by - ay, dz = bz - az;
-    const len2 = dx * dx + dy * dy + dz * dz;
-    let t = len2 === 0 ? 0 : ((cx - ax) * dx + (cy - ay) * dy + (cz - az) * dz) / len2;
-    t = t < 0 ? 0 : t > 1 ? 1 : t;
-    const px = ax + dx * t - cx, py = ay + dy * t - cy, pz = az + dz * t - cz;
-    return px * px + py * py + pz * pz < r * r;
+export function nearestNode(map, x, z) {
+  let best = 0, bd = Infinity;
+  for (let i = 0; i < map.nodes.length; i++) {
+    const n = map.nodes[i];
+    const d = (n.x - x) * (n.x - x) + (n.z - z) * (n.z - z);
+    if (d < bd) { bd = d; best = i; }
   }
-
-  // Nearest waypoint node id to a position.
-  nearestNode(x, z) {
-    const nodes = this.layout.nodes;
-    let best = 0, bd = Infinity;
-    for (let i = 0; i < nodes.length; i++) {
-      const dx = nodes[i][0] - x, dz = nodes[i][1] - z;
-      const d = dx * dx + dz * dz;
-      if (d < bd) { bd = d; best = i; }
-    }
-    return best;
-  }
-
-  nodePos(id, out) {
-    const n = this.layout.nodes[id];
-    out.x = n[0]; out.z = n[1];
-    return out;
-  }
-
-  setBombVisible(x, z, visible) {
-    this.bombMesh.visible = visible;
-    if (visible) this.bombMesh.position.set(x, 0.18, z);
-  }
-
-  dispose() {
-    this.scene.remove(this.group);
-  }
+  return best;
 }
