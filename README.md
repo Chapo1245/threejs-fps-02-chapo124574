@@ -24,7 +24,7 @@ You are the Ember Crew attacker carrying the charge. Five versus five, first to 
 | Click | Fire · R reload · 1–3 weapons · Q last weapon |
 | E (hold) | Plant the charge inside a site |
 | G | Grenade (frag / smoke) · B buy menu · Shift walk silent |
-| C crouch · Space jump · Esc pause · Tab scoreboard |
+| C crouch · Space jump · Esc pause |
 
 ## Play it
 
